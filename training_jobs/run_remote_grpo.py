@@ -73,6 +73,7 @@ class RemoteGRPORunSpec:
     remote_archive: str
     local_evidence_dir: str
     remote_env: dict                # explicit non-secret env (identity ids)
+    experiment_env: dict = dataclasses.field(default_factory=dict)
     expected_inventory: tuple = at.GRPO_EXPECTED_INVENTORY
     hf_token_env_var: str = "HF_TOKEN"
 
@@ -107,6 +108,19 @@ class RemoteGRPORunSpec:
             if k.upper() in ("HF_TOKEN", "TOKEN", "SECRET", "PASSWORD", "AUTH"):
                 raise at.SpecError("remote_env must not carry credential values; "
                                    "tokens are injected at exec time only")
+        # §5 experiment channel: explicit non-credential, non-identity hyperparams.
+        for _k in self.experiment_env:
+            _ku = str(_k).upper()
+            if _ku in ("HF_TOKEN", "TOKEN", "SECRET", "PASSWORD", "AUTH"):
+                raise at.SpecError("experiment_env must not carry credential keys")
+            if _ku in ("JOB_ID", "ATTEMPT_ID", "RUN_INSTANCE", "REMOTE_RUN_DIR", "REMOTE_ARCHIVE"):
+                raise at.SpecError("experiment_env must not override identity/archive keys")
+        for _k, _v in self.experiment_env.items():
+            if _v is None or str(_v).strip() == "":
+                raise at.SpecError(f"experiment_env[{_k!r}] value must be non-empty")
+            if any(c.isspace() for c in str(_v)):
+                raise at.SpecError(f"experiment_env[{_k!r}] value must not contain whitespace")
+
         object.__setattr__(self, "_tspec", tspec)
 
     @staticmethod
@@ -143,6 +157,7 @@ class RemoteGRPORunSpec:
             "remote_archive": self.remote_archive,
             "local_evidence_dir": self.local_evidence_dir,
             "remote_env_keys": sorted(self.remote_env.keys()),
+            "experiment_env_keys": sorted(self.experiment_env.keys()),
             "expected_inventory": list(self.expected_inventory),
         }
 
@@ -155,6 +170,7 @@ def exec_env_for(spec: RemoteGRPORunSpec, env: dict) -> tuple:
     """Identity env + optional HF token pulled from controller env at exec time.
     Returns (env_map, hf_token_present). Token value is never stored/logged."""
     out = dict(spec.remote_env)
+    out.update(spec.experiment_env)
     tok = (env or {}).get(spec.hf_token_env_var, "")
     present = bool(tok)
     if present:
@@ -302,6 +318,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-run-dir", required=True, dest="remote_run_dir")
     p.add_argument("--remote-archive", required=True, dest="remote_archive")
     p.add_argument("--evidence-dir", required=True, dest="evidence_dir")
+    p.add_argument("--env", action="append", default=[], dest="env_pairs",
+                   help="Explicit experiment var KEY=VALUE (non-credential, non-identity); repeatable")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--operator-force-stop", action="store_true", dest="force_stop")
     p.add_argument("--reason", default="")
@@ -310,6 +328,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _build_arg_parser().parse_args(argv)
+    experiment_env = {}
+    for _pair in args.env_pairs:
+        if "=" not in _pair:
+            raise at.SpecError(f"--env expects KEY=VALUE, got {_pair!r}")
+        _k, _v = _pair.split("=", 1)
+        if not _k.strip():
+            raise at.SpecError("--env key must be non-empty")
+        experiment_env[_k.strip()] = _v
     spec = RemoteGRPORunSpec(
         session=args.session, job_id=args.job_id, attempt_id=args.attempt_id,
         run_instance=args.run_instance, remote_job_source=args.job_source,
@@ -317,6 +343,7 @@ def main(argv=None) -> int:
         local_evidence_dir=args.evidence_dir,
         remote_env={"JOB_ID": args.job_id, "ATTEMPT_ID": args.attempt_id,
                     "RUN_INSTANCE": args.run_instance, "REMOTE_RUN_DIR": args.remote_run_dir},
+        experiment_env=experiment_env,
     )
     transport = at.ColabTransport(args.session)
     if args.force_stop:

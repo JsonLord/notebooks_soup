@@ -394,5 +394,52 @@ class RunnerStaticInvariants(unittest.TestCase):
         self.assertNotIn("grpo_artifacts_bundle", src)
 
 
+class RunnerExperimentEnv(unittest.TestCase):
+    """§5/§12 wiring: hyperparameters reach the worker; producer stays clean."""
+
+    def test_experiment_values_reach_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = _spec(tmp, experiment_env={"MAX_STEPS": "10", "LEARNING_RATE": "1e-6",
+                                              "TEMPERATURE": "0.6"})
+            tr = FakeRunnerTransport(remote=_remote(spec), exec_rc=GOOD_RC)
+            rgg.run_run(spec, tr, env={"HF_TOKEN": "hf_top_secret_123"}, is_tracked=lambda p: True)
+            _path, env, _out = tr.execs[0]  # first exec is the GRPO worker
+            self.assertEqual(env.get("MAX_STEPS"), "10")
+            self.assertEqual(env.get("LEARNING_RATE"), "1e-6")
+            self.assertEqual(env.get("TEMPERATURE"), "0.6")
+            self.assertEqual(env.get("JOB_ID"), spec.job_id)
+            self.assertIn("HF_TOKEN", env)
+
+    def test_producer_exec_has_no_experiment_or_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = _spec(tmp, experiment_env={"MAX_STEPS": "10"})
+            tr = FakeRunnerTransport(remote=_remote(spec), exec_rc=GOOD_RC)
+            rgg.run_run(spec, tr, env={"HF_TOKEN": "hf_top_secret_123"}, is_tracked=lambda p: True)
+            prod_env = tr.execs[1][1]  # producer exec
+            self.assertNotIn("MAX_STEPS", prod_env)
+            self.assertNotIn("HF_TOKEN", prod_env)
+            self.assertEqual(prod_env.get("REMOTE_ARCHIVE"), spec.remote_archive)
+
+    def test_credential_experiment_key_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(at.SpecError):
+                _spec(tmp, experiment_env={"HF_TOKEN": "leak"})
+
+    def test_identity_experiment_key_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(at.SpecError):
+                _spec(tmp, experiment_env={"JOB_ID": "other"})
+
+    def test_empty_experiment_value_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(at.SpecError):
+                _spec(tmp, experiment_env={"MAX_STEPS": "  "})
+
+    def test_experiment_keys_persisted_not_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = _spec(tmp, experiment_env={"LEARNING_RATE": "1e-6"})
+            self.assertIn("LEARNING_RATE", spec.state_fields().get("experiment_env_keys", []))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
