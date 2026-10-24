@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# LEGACY_DEBUG_HELPER — NOT_PRODUCTION_ARTIFACT_PATH
+# Production artifact path: artifact_produce.py + artifact_transaction.py
+# (durable archive + sibling .sha256, download-authoritative, guarded stop).
 """Remote READ-ONLY: bundle §13 artifacts excluding multi-GB weight/optimizer
 blobs so the archive is small enough to hash + download reliably. NO training."""
 import hashlib

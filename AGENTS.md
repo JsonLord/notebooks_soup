@@ -25,6 +25,12 @@ Do not call colab new or colab run unless the operator explicitly authorizes pro
 Local commands may inspect/version/transport files: git, gh, ls, find, cat, head, tail, grep, rg, sed, awk, jq, sha256sum, wc, stat, mkdir, cp, mv, tar, and Colab session/status/log/download/stop/exec commands.
 These commands must not be used to execute notebook/training code locally.
 
+## LOCAL CONTROLLER PYTHON (narrow exception)
+Direct execution of stdlib-only local controller scripts is allowed ONLY when all hold:
+stdlib/controller-local dependencies only; no training-framework imports (torch, Transformers, TRL, PEFT, datasets, accelerate, unsloth); no model or dataset loading; no local notebook/training execution; only git/filesystem/Colab orchestration; all remote execution still via colab exec.
+Explicitly allowed: training_jobs/artifact_transaction.py, training_jobs/run_remote_grpo.py, and their deterministic controller tests.
+This exception does NOT weaken COLAB_ONLY. Training job .py files, notebooks, pytest that imports training code, CUDA probes, and local model/dataset execution remain forbidden.
+
 ## Remote proof
 Every training job must capture evidence from the remote kernel identifying EXECUTION_TARGET=COLAB_REMOTE, hostname, CUDA availability, and GPU name when present.
 

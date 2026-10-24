@@ -292,6 +292,22 @@ class ColabTransport(RemoteTransport):
         r = self._cli(["stop", "-s", self.session])
         return r.returncode == 0
 
+    def exec_file(self, local_path: str, env=None, output_path: str = None) -> int:
+        """Foreground remote exec of a local script via the CLI (§7).
+
+        env VALUES are NEVER logged or persisted — only the key COUNT is logged.
+        Remote stdout is diagnostic only and is never written into evidence.
+        """
+        args = ["exec", "-s", self.session, "-f", local_path]
+        for k, v in sorted((env or {}).items()):
+            args += ["--env", f"{k}={v}"]
+        r = self._cli(args)
+        if output_path:
+            with open(output_path, "a", encoding="utf-8") as fh:
+                fh.write(f"[exec] rc={r.returncode} file={os.path.basename(local_path)} "
+                         f"env_keys={len(env or {})}\n")
+        return r.returncode
+
 
 def _retry(fn: Callable[[], bool], attempts: int = 3) -> bool:
     """Retry idempotent/safe operations (§17)."""
@@ -485,6 +501,7 @@ def build_journal(spec: TransactionSpec, producer: dict, download: dict, sha: di
         "archive_size": int(download.get("local_archive_size") or 0) or None,
         "sha_file_size": int(download.get("local_sha_size") or 0) or None,
         "producer_done": bool(producer.get("producer_done")),
+        "producer_check_mode": producer.get("mode"),
         "expected_inventory": list(spec.expected_inventory),
         "observed_inventory": validate.get("observed_inventory", []),
         "status": status,
@@ -493,18 +510,27 @@ def build_journal(spec: TransactionSpec, producer: dict, download: dict, sha: di
 
 
 def run_transaction(spec: TransactionSpec, transport: RemoteTransport, *,
-                    journal_path: Optional[str] = None, skip_producer_check: bool = False) -> dict:
+                    journal_path: Optional[str] = None, skip_producer_check: bool = False,
+                    producer_check_mode: str = "remote_stat") -> dict:
     """Execute the full guarded transaction and persist the journal.
 
     Idempotent and resumable (§16): safe to call repeatedly; already-downloaded
     valid local copies are reused. On any unmet gate session_stop_allowed=false.
+
+    producer_check_mode (§9): "remote_stat" verifies the durable remote files
+    before download. "download_authoritative" (required for transports without
+    reliable remote stat, e.g. ColabTransport) proves producer completion by the
+    successful non-empty foreground downloads themselves. skip_producer_check is
+    retained ONLY as a deprecated alias for "download_authoritative"; in NO mode
+    is producer_done ever prefilled true.
     """
     jp = journal_path or journal_path_for(spec)
-    producer = {"producer_done": True, "code": None}
-    if not skip_producer_check:
-        producer = check_producer_done(spec, transport)
-    if not producer["producer_done"]:
-        download = {"download_complete": False, "code": producer["code"]}
+    if producer_check_mode not in ("remote_stat", "download_authoritative"):
+        raise ValueError("producer_check_mode must be remote_stat or download_authoritative")
+    if skip_producer_check:
+        producer_check_mode = "download_authoritative"
+
+    def _fail(producer, download):
         sha = {"remote_sha_available": False, "local_sha_available": False, "sha_match": False, "code": None}
         validate = {"archive_integrity_ok": False, "archive_inventory_ok": False, "observed_inventory": [], "traversal": False, "code": None}
         gates = compute_gates(download, sha, validate)
@@ -512,7 +538,20 @@ def run_transaction(spec: TransactionSpec, transport: RemoteTransport, *,
         write_journal(jp, journal)
         return journal
 
-    download = download_stage(spec, transport)
+    if producer_check_mode == "download_authoritative":
+        download = download_stage(spec, transport)
+        done = bool(download.get("download_complete"))
+        producer = {"producer_done": done,
+                    "code": None if done else download.get("code"),
+                    "mode": producer_check_mode}
+        if not done:
+            return _fail(producer, download)
+    else:
+        producer = check_producer_done(spec, transport)
+        producer["mode"] = producer_check_mode
+        if not producer["producer_done"]:
+            return _fail(producer, {"download_complete": False, "code": producer["code"]})
+        download = download_stage(spec, transport)
     if download["download_complete"]:
         sha = sha_stage(spec)
         if sha.get("sha_match"):

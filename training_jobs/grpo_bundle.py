@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# LEGACY_DEBUG_HELPER — NOT_PRODUCTION_ARTIFACT_PATH
+# Production artifact path: artifact_produce.py + artifact_transaction.py
+# (durable archive + sibling .sha256, download-authoritative, guarded stop).
 """Remote-only READ-ONLY: bundle a GRPO attempt dir for retrieval + read-only
 trl.GRPOConfig signature introspection (NO re-run). Attempt from GRPO_ATTEMPT env."""
 import hashlib

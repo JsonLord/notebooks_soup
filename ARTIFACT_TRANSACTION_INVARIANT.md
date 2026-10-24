@@ -71,3 +71,23 @@ D both downloaded, unverified -> verify locally.
 E SHA matches, inventory not checked -> check archive/inventory.
 F transaction complete, dies before stop -> re-read persisted PASS, then stop.
 G stop sent, dies before record -> reconcile session; never start a new attempt.
+
+## Orchestration (run_remote_grpo.py)
+
+`training_jobs/run_remote_grpo.py` is the single authoritative local entry point
+for a remote GRPO run. It never imports training frameworks, never provisions
+compute (`colab new`/`colab run` are forbidden there), and never executes
+training locally — remote execution goes only through the transport (`colab exec`).
+
+Producer proof for Colab runs uses `producer_check_mode="download_authoritative"`:
+producer completion is proven by the successful non-empty downloads of the archive
+AND its sibling `.sha256` — never by stdout, an exit code, or a prefilled flag. If
+either download fails, `producer_done=false` and shutdown stays blocked. The journal
+records `producer_check_mode` truthfully; `skip_producer_check` is only a deprecated
+alias for this mode.
+
+Shutdown is singular: the runner can stop a session only via `guarded_stop`
+(normal), `reconcile_stop` (resume), or `operator_force_stop` (explicit emergency
+with a non-empty reason, never recorded as success). Training status and artifact
+status are separate axes: TRAINING_FAIL + a PASSed transaction may stop (failure
+evidence is safely retrieved); TRAINING_PASS + a failed transaction must not.

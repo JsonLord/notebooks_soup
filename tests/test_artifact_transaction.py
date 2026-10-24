@@ -342,6 +342,65 @@ class Case(unittest.TestCase):
         self.assertIsNone(at.parse_remote_sha(""))
         self.assertIsNone(at.parse_remote_sha("zz" * 32 + "  x"))
 
+    # ---- §9 download-authoritative producer proof (Colab transport reality) ----
+    def test_22_download_authoritative_proves_producer(self):
+        """No remote-stat capability: producer_done is EARNED by downloads."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = self._spec(tmp)
+            t = self._good_transport(spec)
+            t.remote_exists = lambda path: False   # emulate ColabTransport stat gap
+            t.remote_size = lambda path: -1
+            j = at.run_transaction(spec, t, producer_check_mode="download_authoritative")
+            self.assertEqual(j["producer_check_mode"], "download_authoritative")
+            self.assertTrue(j["producer_done"])
+            self.assertEqual(j["status"], at.ARTIFACT_TRANSACTION_PASS)
+            self.assertTrue(j["session_stop_allowed"])
+            self.assertEqual(at.guarded_stop(t, at.journal_path_for(spec))["session_stopped"], True)
+
+    def test_23_download_authoritative_archive_fail(self):
+        """Archive download failure => producer_done=false (never prefilled), no stop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = self._spec(tmp)
+            t = self._good_transport(spec)
+            t.remote_exists = lambda path: False
+            t.remote_size = lambda path: -1
+            del t.remote[spec.remote_archive]
+            j = at.run_transaction(spec, t, producer_check_mode="download_authoritative")
+            self.assertFalse(j["producer_done"])
+            self.assertEqual(j["failure_code"], at.DOWNLOAD_ARCHIVE_FAILED)
+            self.assertFalse(j["session_stop_allowed"])
+            self.assertEqual(t.stop_calls, 0)
+
+    def test_24_download_authoritative_sha_fail(self):
+        """SHA-file download failure => producer_done=false, no stop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = self._spec(tmp)
+            t = self._good_transport(spec)
+            t.remote_exists = lambda path: False
+            t.remote_size = lambda path: -1
+            del t.remote[spec.remote_sha_file]
+            j = at.run_transaction(spec, t, producer_check_mode="download_authoritative")
+            self.assertFalse(j["producer_done"])
+            self.assertEqual(j["failure_code"], at.DOWNLOAD_SHA_FAILED)
+            self.assertFalse(j["session_stop_allowed"])
+            self.assertEqual(t.stop_calls, 0)
+
+    def test_25_journal_records_producer_check_mode(self):
+        """Journal is truthful about which proof mode was used (§14)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = self._spec(tmp)
+            t = self._good_transport(spec)
+            j = at.run_transaction(spec, t, producer_check_mode="download_authoritative")
+            self.assertEqual(j["producer_check_mode"], "download_authoritative")
+            persisted = at.read_journal(at.journal_path_for(spec))
+            self.assertEqual(persisted["producer_check_mode"], "download_authoritative")
+            t2 = self._good_transport(self._spec(tempfile.mkdtemp(),
+                                                  remote_archive="/content/opentraining/run2.tar.gz"))
+            j2 = at.run_transaction(self._spec(tempfile.mkdtemp(),
+                                               remote_archive="/content/opentraining/run3.tar.gz"),
+                                    t2, producer_check_mode="remote_stat")
+            self.assertEqual(j2["producer_check_mode"], "remote_stat")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
