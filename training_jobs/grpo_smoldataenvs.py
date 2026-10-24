@@ -56,6 +56,134 @@ def score_from_rewards(rewards):
     nonzero_rate = (nonzero / n) if n else None
     return {"n": n, "mean_reward": mean, "nonzero_reward_rate": nonzero_rate}
 
+# ---- byte-identical copy of training_jobs/grpo_prompt_contract.py
+# A deterministic contract test AST-compares these four definitions to kill drift.
+def inspect_staged_contract(sb, inp="/home/user/input"):
+    """Return a structured contract describing the ACTUAL staged files in `inp`.
+
+    Runs a stdlib-only inspection INSIDE the sandbox `sb` (huggingface_hub
+    Sandbox, i.e. sb.run(...) -> object with .stdout) so the result reflects the
+    bytes the executed program will actually see. Schema is established with no
+    fabrication and never raises: each file is tagged SCHEMA_READ_OK /
+    SCHEMA_PARTIAL / SCHEMA_READ_FAILED (csv) or SQLITE_READ_OK /
+    SQLITE_READ_FAILED (sqlite). One malformed file never destroys the whole
+    contract. Row VALUES are never read; only names/columns/tables. Shape:
+      {"dir": ..., "files": [{"name", "kind", ...}, ...]}
+    """
+    snippet = (
+        "import os,sys,json,csv,sqlite3\n"
+        "d=sys.argv[1]\n"
+        "files=sorted(os.listdir(d)) if os.path.isdir(d) else []\n"
+        "out=[]\n"
+        "for f in files:\n"
+        "    p=os.path.join(d,f)\n"
+        "    if not os.path.isfile(p): continue\n"
+        "    low=f.lower(); rec={'name':f,'kind':'other'}\n"
+        "    if low.endswith('.csv'):\n"
+        "        rec['kind']='csv'\n"
+        "        try:\n"
+        "            with open(p,'rb') as fh: raw=fh.read()\n"
+        "            txt=raw.decode('utf-8','replace')\n"
+        "            lines=txt.replace('\\r\\n','\\n').replace('\\r','\\n').split('\\n')\n"
+        "            hdr=next(csv.reader(lines))\n"
+        "            cols=[c.strip() for c in hdr if c.strip()!='']\n"
+        "            first=lines[0] if lines else ''\n"
+        "            if len(cols)==0:\n"
+        "                rec['schema_read']='SCHEMA_READ_FAILED'; rec['columns']=None\n"
+        "            elif len(cols)==1 and len(first)>60 and ',' not in first:\n"
+        "                rec['schema_read']='SCHEMA_PARTIAL'; rec['columns']=cols\n"
+        "            else:\n"
+        "                rec['schema_read']='SCHEMA_READ_OK'; rec['columns']=cols\n"
+        "        except Exception as e:\n"
+        "            rec['schema_read']='SCHEMA_READ_FAILED'; rec['columns']=None; rec['err']=type(e).__name__\n"
+        "    elif low.endswith('.sqlite') or low.endswith('.db'):\n"
+        "        rec['kind']='sqlite'\n"
+        "        try:\n"
+        "            con=sqlite3.connect('file:%s?mode=ro'%p,uri=True); cur=con.cursor()\n"
+        "            tabs=[r[0] for r in cur.execute(\"select name from sqlite_master where type='table' and name not like 'sqlite_%'\").fetchall()]\n"
+        "            sch={}\n"
+        "            for t in tabs:\n"
+        "                sch[t]=[r[1] for r in cur.execute('PRAGMA table_info(\"%s\")'%t).fetchall()]\n"
+        "            rec['tables']=sch; rec['sqlite_read']='SQLITE_READ_OK'; con.close()\n"
+        "        except Exception as e:\n"
+        "            rec['tables']={}; rec['sqlite_read']='SQLITE_READ_FAILED'; rec['err']=type(e).__name__\n"
+        "    out.append(rec)\n"
+        "print(json.dumps({'dir':d,'files':out}))\n"
+    )
+    esc = snippet.replace("'", "'\\''")
+    res = sb.run("printf '%%s' '%s' > /tmp/_ic.py && python3 /tmp/_ic.py '%s'" % (esc, inp), check=False)
+    raw = (getattr(res, "stdout", "") or "").strip()
+    try:
+        return json.loads(raw) if raw else {"dir": inp, "files": []}
+    except Exception:
+        return {"dir": inp, "files": []}
+
+
+def stage_bucket(sb, bucket_prefix):
+    """Wipe the input dir and stage exactly this bucket's files, deterministically.
+
+    Mirrors the worker's proven staging shell. The staged filesystem is then
+    authoritative; call inspect_staged_contract immediately after to derive the
+    prompt contract, and the task program runs in this same directory.
+    """
+    bp = (bucket_prefix or "").replace("'", "'\\''")
+    return sb.run("rm -rf /home/user/input/* && BUCKET_PREFIX='%s' python3 /opt/pull_bucket.py" % bp, check=False)
+
+
+def build_prompt(r, contract=None):
+    """Build the chat messages for row `r`, disclosing the staged contract.
+
+    When `contract` (from inspect_staged_contract) is provided, every staged
+    filename plus its CSV columns / SQLite tables+columns is surfaced, and the
+    prompt carries a strict output contract (use exact names; the final answer is
+    the last non-empty stdout line). When `contract` is None it degrades to the
+    legacy nominal-files prompt, so the trainer's dataset `.map` site -- where no
+    bucket is staged yet -- keeps producing the SAME prompt as before with zero
+    behavior change. No gold / solution / grader internals are ever emitted.
+    """
+    system = "You are a data analyst. You answer questions about data files by writing a short Python program and reading what it prints."
+    files = (contract or {}).get("files") or []
+    if not files:
+        files = [{"name": f, "kind": "unknown"} for f in r.get("files", [])]
+    parts = ["Available files in the input directory (use these exact names):", ""]
+    for fr in files:
+        parts.append("- " + str(fr.get("name")))
+        kind = fr.get("kind")
+        if kind == "csv" and fr.get("columns"):
+            parts.append("  Columns: " + ", ".join(fr["columns"]))
+        elif kind == "csv":
+            parts.append("  Schema: unavailable (this file is malformed; open it and inspect it yourself).")
+        elif kind == "sqlite" and fr.get("tables"):
+            for t, cols in fr["tables"].items():
+                parts.append("  Table " + str(t) + ": " + ", ".join(cols))
+    contract_text = ("\n".join(parts) + "\n\n") if files else ""
+    user = ("%s\n\n%s"
+            "The files are in /home/user/input and your program runs in that directory.\n"
+            "Use the exact filenames and column/table names shown above.\n"
+            "Read files from the provided input directory.\n"
+            "Write one Python program in a ```python block, then stop.\n"
+            "- Look at the data if you need to, then compute the answer.\n"
+            "- The final answer must be the last non-empty stdout line.\n"
+            "- Keep it under 40 lines." % (r["question"], contract_text))
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def task_validity_for(bucket_prefix):
+    """Return the experiment eligibility label for a bucket prefix.
+
+    GOLD_UNREPRODUCIBLE is applied only to a task whose gold answer was proven,
+    by the known-correct-data discriminator, to be irreproducible from the
+    staged data (here: fbi-us__california-crime, whose gold 'Imperial3,
+    0.003403' does not equal the literal Imperial3 ratio <latex>5/17338</latex>
+    nor the data's true minimum). This is an annotation, not a dataset edit, not
+    a deletion, and not grader softening. Everything else is VALIDATED.
+    """
+    bp = (bucket_prefix or "").strip().lower()
+    if "california-crime" in bp or "fbi-us__california" in bp:
+        return "GOLD_UNREPRODUCIBLE"
+    return "VALIDATED"
+
+
 
 # ---- environment / JobSpec parsing (§5: identity has no silent defaults) ----
 def now():
@@ -203,14 +331,8 @@ _rewarding_flag = {"done": False}
 
 # ---- notebook reward helpers (UNCHANGED semantics), defined before preflight ----
 SYSTEM = "You are a data analyst. You answer questions about CSV files by writing a short Python program and reading what it prints."
-def build_prompt(r):
-    files = "\n".join("- %s" % f for f in r["files"])
-    user = ("%s\n\nThe files are in /home/user/input and your program runs in that directory:\n%s\n\n"
-            "Write one Python program in a ```python block, then stop.\n\n"
-            "- Look at the data if you need to, then compute the answer.\n"
-            "- The LAST thing the program prints must be the answer on its own.\n"
-            "- Keep it under 40 lines." % (r["question"], files))
-    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+
+
 def extract_code(completion):
     text = completion[-1]["content"] if isinstance(completion, list) else completion
     blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text or "", re.S)
@@ -234,6 +356,13 @@ def reward_correct(completions, **cols):
         STATE["text_sizes_chars"].append(len(text or ""))
         STATE["completion_lengths"].append(len(text or ""))
         code = extract_code(c)
+        if code:
+            try:
+                _bp = cols.get("bucket_prefix")[i]
+            except Exception:
+                _bp = None
+            if _bp:
+                stage_bucket(sb, _bp)
         printed = run_program(code) if code else ""
         try:
             g = grader.grade(cols["answer"][i], printed, reward_mode=cols["reward_mode"][i],
@@ -484,7 +613,12 @@ def gen_eval_pass(model, tokenizer):
         model.eval()
         for r in eval_rows:
             try:
-                msgs = build_prompt(r)
+                _bp = r["bucket_prefix"]
+                if _bp:
+                    stage_bucket(sb, _bp)
+                _contract = inspect_staged_contract(sb)
+                STATE.setdefault("eval_task_validity", []).append(task_validity_for(_bp))
+                msgs = build_prompt(r, contract=_contract)
                 text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 enc = tok(text, return_tensors="pt").to(model.device)
                 with torch.no_grad():
