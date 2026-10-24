@@ -292,16 +292,23 @@ class ColabTransport(RemoteTransport):
         r = self._cli(["stop", "-s", self.session])
         return r.returncode == 0
 
-    def exec_file(self, local_path: str, env=None, output_path: str = None) -> int:
+    def exec_file(self, local_path: str, env=None, output_path: str = None,
+                  timeout: int = 3600) -> int:
         """Foreground remote exec of a local script via the CLI (§7).
 
         env VALUES are NEVER logged or persisted — only the key COUNT is logged.
         Remote stdout is diagnostic only and is never written into evidence.
+
+        A generous `--timeout` is passed to the colab CLI: its own default is
+        30s, which would abort a real GRPO run mid-training (preflight present,
+        metrics/results missing -> INVENTORY_MISMATCH). The local subprocess cap
+        is held strictly above the remote cap so it never truncates the run.
         """
-        args = ["exec", "-s", self.session, "-f", local_path]
+        args = ["exec", "-s", self.session, "-f", local_path,
+                "--timeout", str(int(timeout))]
         for k, v in sorted((env or {}).items()):
             args += ["--env", f"{k}={v}"]
-        r = self._cli(args)
+        r = self._cli(args, timeout=int(timeout) + 120)
         if output_path:
             with open(output_path, "a", encoding="utf-8") as fh:
                 fh.write(f"[exec] rc={r.returncode} file={os.path.basename(local_path)} "
