@@ -27,7 +27,7 @@ import grpo_prompt_contract as gpc  # noqa: E402
 WORKER = os.path.join(TRAINING_JOBS, "grpo_smoldataenvs.py")
 MODULE = os.path.join(TRAINING_JOBS, "grpo_eval_split.py")
 MODULE_PC = os.path.join(TRAINING_JOBS, "grpo_prompt_contract.py")
-NAMES_PC = ("inspect_staged_contract", "stage_bucket", "build_prompt", "task_validity_for", "extract_code")
+NAMES_PC = ("inspect_staged_contract", "stage_bucket", "build_prompt", "task_validity_for", "extract_code", "resolve_max_new_tokens")
 
 
 def _funcs(path):
@@ -385,6 +385,79 @@ class CodeOutputContract(unittest.TestCase):
             self.assertNotIn(".decode(", seg, "decode in %s" % name)
             self.assertNotIn(".encode(", seg, "encode in %s" % name)
         self.assertIn(".strip()", funcs["extract_code"])
+
+
+class TokenBudgetResolver(unittest.TestCase):
+    # §13: the generation token budget must be an explicit experiment parameter
+    # whose configured value provably reaches generation, without silently
+    # changing the production default (128) on missing/malformed input.
+
+    def test_max_new_tokens_precedence(self):
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "256"}), 256)
+
+    def test_max_new_tokens_beats_legacy(self):
+        self.assertEqual(
+            gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "256", "MAX_COMPLETION_LENGTH": "128"}), 256)
+
+    def test_legacy_fallback(self):
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_COMPLETION_LENGTH": "256"}), 256)
+
+    def test_default_when_absent(self):
+        self.assertEqual(gpc.resolve_max_new_tokens({}), 128)
+
+    def test_malformed_and_nonpositive_keep_default(self):
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "abc"}), 128)
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "0"}), 128)
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "-5"}), 128)
+        self.assertEqual(gpc.resolve_max_new_tokens({"MAX_NEW_TOKENS": "   "}), 128)
+
+    def test_worker_generation_uses_resolved_value(self):
+        with open(WORKER, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("MAX_COMPLETION_LENGTH = resolve_max_new_tokens(os.environ, 128)", src)
+        self.assertIn("MAX_NEW_TOKENS = MAX_COMPLETION_LENGTH", src)
+        self.assertIn("max_new_tokens=MAX_NEW_TOKENS", src)   # value reaches model.generate
+        self.assertIn('"max_new_tokens": MAX_NEW_TOKENS', src)  # persisted in manifest
+        self.assertIn('STATE["max_new_tokens"] = MAX_NEW_TOKENS', src)  # persisted in results.json
+
+
+class TruncationClassification(unittest.TestCase):
+    # §5: TOKEN_CAP_TRUNCATION requires BOTH a real token-cap hit AND a
+    # syntactically-incomplete completion. Never blanket-label a SyntaxError.
+
+    def _fail(self, msg, code="", etype="SyntaxError"):
+        return {"ok": False, "syntax_error_type": etype,
+                "syntax_error_line": None, "syntax_error_message": msg}, code
+
+    def test_cap_plus_unterminated_is_truncation(self):
+        parse, code = self._fail("unterminated string literal (detected at line 1)")
+        self.assertEqual(gpc.classify_truncation(code, parse, True), "TOKEN_CAP_TRUNCATION")
+
+    def test_cap_plus_never_closed_is_truncation(self):
+        parse, _ = self._fail("'(' was never closed")
+        self.assertEqual(gpc.classify_truncation("", parse, True), "TOKEN_CAP_TRUNCATION")
+
+    def test_cap_plus_trailing_open_bracket_is_truncation(self):
+        parse, _ = self._fail("invalid syntax", code="x = sum([1, 2, 3")
+        self.assertEqual(gpc.classify_truncation("x = sum([1, 2, 3", parse, True), "TOKEN_CAP_TRUNCATION")
+
+    def test_cap_but_deterministic_error_is_genuine(self):
+        parse, _ = self._fail("invalid syntax", code="x = = 1")
+        self.assertEqual(gpc.classify_truncation("x = = 1", parse, True), "GENUINE_SYNTAX_FAILURE")
+
+    def test_finished_but_broken_is_genuine(self):
+        parse, _ = self._fail("unterminated string literal (detected at line 1)", code="print('a")
+        self.assertEqual(gpc.classify_truncation("print('a", parse, False), "GENUINE_SYNTAX_FAILURE")
+
+    def test_empty_is_unknown(self):
+        parse = {"ok": False, "syntax_error_type": "EMPTY_SOURCE",
+                 "syntax_error_line": None, "syntax_error_message": "no source"}
+        self.assertEqual(gpc.classify_truncation("", parse, True), "UNKNOWN_PARSE_FAILURE")
+
+    def test_parse_ok_shortcircuits(self):
+        parse = {"ok": True, "syntax_error_type": None,
+                 "syntax_error_line": None, "syntax_error_message": None}
+        self.assertEqual(gpc.classify_truncation("print(1)", parse, True), "PARSE_OK")
 
 
 if __name__ == "__main__":

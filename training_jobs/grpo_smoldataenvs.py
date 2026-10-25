@@ -244,7 +244,35 @@ LEARNING_RATE = _num("LEARNING_RATE", 3e-6, float)
 TEMPERATURE = _num("TEMPERATURE", 0.8, float)
 REPETITION_PENALTY = _num("REPETITION_PENALTY", 1.05, float)
 NUM_GENERATIONS = _num("NUM_GENERATIONS", 2, int)
-MAX_COMPLETION_LENGTH = _num("MAX_COMPLETION_LENGTH", 128, int)
+def resolve_max_new_tokens(env=None, default=128):
+    """Resolve the effective generation token budget deterministically.
+
+    Precedence: MAX_NEW_TOKENS, then MAX_COMPLETION_LENGTH (legacy name), then
+    `default` (production 128). A missing/blank value falls through; a
+    non-integer or non-positive value returns `default`, so a malformed
+    experiment setting never silently changes the production default.
+    """
+    import os as _os
+    src = _os.environ if env is None else env
+    for key in ("MAX_NEW_TOKENS", "MAX_COMPLETION_LENGTH"):
+        raw = src.get(key)
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            v = int(s)
+        except Exception:
+            return default
+        if v <= 0:
+            return default
+        return v
+    return default
+
+
+MAX_COMPLETION_LENGTH = resolve_max_new_tokens(os.environ, 128)
+MAX_NEW_TOKENS = MAX_COMPLETION_LENGTH
 MAX_STEPS = _num("MAX_STEPS", 20, int)
 TRAIN_TASK_LIMIT = _num("TRAIN_TASK_LIMIT", 1, int)
 EVAL_TASK_LIMIT = _num("EVAL_TASK_LIMIT", 6, int)
@@ -385,6 +413,7 @@ def reward_correct(completions, **cols):
 def persist_final(status, err=None):
     STATE["status"] = status
     STATE["error"] = err
+    STATE["max_new_tokens"] = MAX_NEW_TOKENS
     try:
         with open(RUN + "/results.json", "w") as fh:
             json.dump(STATE, fh, indent=2)
@@ -409,7 +438,7 @@ manifest = {"job_id": JOB_ID, "attempt_id": ATTEMPT_ID, "run_instance": RUN_INST
             "provider": "colab", "model": MODEL, "dataset": DS, "difficulty_tiers": difficulty_tiers,
             "train_task_limit": TRAIN_TASK_LIMIT, "eval_task_limit": EVAL_TASK_LIMIT,
             "num_generations": NUM_GENERATIONS, "max_steps": MAX_STEPS,
-            "max_completion_length": MAX_COMPLETION_LENGTH, "seed": SEED,
+            "max_completion_length": MAX_COMPLETION_LENGTH, "max_new_tokens": MAX_NEW_TOKENS, "seed": SEED,
             "effective_hyperparameters": {"learning_rate": LEARNING_RATE, "temperature": TEMPERATURE,
                                           "repetition_penalty": REPETITION_PENALTY,
                                           "gradient_checkpointing": True},
@@ -629,7 +658,7 @@ def gen_eval_pass(model, tokenizer):
                 text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 enc = tok(text, return_tensors="pt").to(model.device)
                 with torch.no_grad():
-                    out = model.generate(**enc, max_new_tokens=MAX_COMPLETION_LENGTH, do_sample=True,
+                    out = model.generate(**enc, max_new_tokens=MAX_NEW_TOKENS, do_sample=True,
                                          temperature=TEMPERATURE, repetition_penalty=REPETITION_PENALTY,
                                          top_p=1.0, pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
                 gen = tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)

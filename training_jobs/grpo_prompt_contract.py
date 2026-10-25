@@ -245,3 +245,63 @@ def classify_form_error(code, parse):
     if lit > 0 and primary != "LITERAL_ESCAPED_NEWLINES":
         flags_list.append("LITERAL_ESCAPED_NEWLINES")
     return dict(flags, primary=primary, flags=flags_list)
+
+
+def resolve_max_new_tokens(env=None, default=128):
+    """Resolve the effective generation token budget deterministically.
+
+    Precedence: MAX_NEW_TOKENS, then MAX_COMPLETION_LENGTH (legacy name), then
+    `default` (production 128). A missing/blank value falls through; a
+    non-integer or non-positive value returns `default`, so a malformed
+    experiment setting never silently changes the production default.
+    """
+    import os as _os
+    src = _os.environ if env is None else env
+    for key in ("MAX_NEW_TOKENS", "MAX_COMPLETION_LENGTH"):
+        raw = src.get(key)
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            v = int(s)
+        except Exception:
+            return default
+        if v <= 0:
+            return default
+        return v
+    return default
+
+
+def classify_truncation(code, parse, hit_cap):
+    """Classify one AST failure as token-cap truncation vs genuine breakage.
+
+    TOKEN_CAP_TRUNCATION requires BOTH evidence that the completion consumed the
+    full budget (`hit_cap`, from the ACTUAL generated-token count) AND that it
+    terminates syntactically incomplete (unterminated string / never-closed
+    delimiter / EOF-while-scanning / trailing open token). A parse failure that
+    finished before the cap, or that fails for a deterministic reason unrelated
+    to a cut, is GENUINE_SYNTAX_FAILURE; empty/undecodable is UNKNOWN_PARSE_FAILURE.
+    """
+    if parse.get("ok"):
+        return "PARSE_OK"
+    m = (parse.get("syntax_error_message") or "").lower()
+    if (not m) or (parse.get("syntax_error_type") or "") == "EMPTY_SOURCE":
+        return "UNKNOWN_PARSE_FAILURE"
+    incomplete = ("never closed" in m or "unterminated" in m or "eof while" in m
+                  or "eol while" in m or "unexpected eof" in m)
+    if not incomplete:
+        s = (code or "").rstrip()
+        if s.endswith((",", ":", "(", "[", "{", ".", "+", "-", "*", "/", "%", "=", "<", ">", "|", "&")):
+            incomplete = True
+        else:
+            for a, b in (("(", ")"), ("[", "]"), ("{", "}")):
+                if s.count(a) != s.count(b):
+                    incomplete = True
+                    break
+        if (not incomplete) and (s.count("'") % 2 == 1 or s.count('"') % 2 == 1):
+            incomplete = True
+    if hit_cap and incomplete:
+        return "TOKEN_CAP_TRUNCATION"
+    return "GENUINE_SYNTAX_FAILURE"
