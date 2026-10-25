@@ -17,6 +17,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -279,6 +280,12 @@ EVAL_TASK_LIMIT = _num("EVAL_TASK_LIMIT", 6, int)
 FP16 = _bool("FP16", True)
 BF16 = _bool("BF16", False)
 USE_VLLM = _bool("USE_VLLM", False)
+# ---- §17/§18 training-method parameterization (full path UNCHANGED when method != lora) ----
+TRAINING_METHOD = (_env("TRAINING_METHOD", "full") or "full").strip().lower()
+LORA_R = _num("LORA_R", 16, int)
+LORA_ALPHA = _num("LORA_ALPHA", 32, int)
+LORA_DROPOUT = _num("LORA_DROPOUT", 0.05, float)
+LORA_TARGET_MODE = _env("LORA_TARGET_MODE", "all-linear")
 
 print("EXECUTION_TARGET=COLAB_REMOTE", flush=True)
 os.makedirs(ART + "/checkpoint", exist_ok=True)
@@ -363,6 +370,7 @@ sb = None
 row = None
 grader = None
 _rewarding_flag = {"done": False}
+_lora_group_rewards = []  # §11/§12: per-GRPO-group reward vectors
 
 # ---- notebook reward helpers (UNCHANGED semantics), defined before preflight ----
 SYSTEM = "You are a data analyst. You answer questions about CSV files by writing a short Python program and reading what it prints."
@@ -408,6 +416,26 @@ def reward_correct(completions, **cols):
         out.append(val)
         STATE["rewards"].append(val)
         bnd("reward_%d_computed" % (i + 1), i + 1 == len(out), True)
+    # §11/§12 per-GRPO-group reward variance (pure recording, no semantics change)
+    if TRAINING_METHOD == "lora":
+        try:
+            import statistics as _stg
+            _g = list(out)
+            _bpg = None
+            try:
+                _bpg = cols.get("bucket_prefix")[0]
+            except Exception:
+                _bpg = None
+            _lora_group_rewards.append({
+                "group_index": len(_lora_group_rewards),
+                "bucket_prefix": _bpg,
+                "rewards": _g,
+                "all_identical": (len(set(_g)) <= 1),
+                "reward_variance": round(_stg.pvariance(_g), 8) if len(_g) > 1 else 0.0,
+                "informative": (len(set(_g)) > 1),
+                "nonzero_count": sum(1 for v in _g if v > 0)})
+        except Exception:
+            pass
     return out
 
 def persist_final(status, err=None):
@@ -690,9 +718,198 @@ def gen_eval_pass(model, tokenizer):
     sc["rewards"] = rewards
     return sc
 
+def build_lora_trainer(train, cfg):
+    """Bounded LoRA-GRPO build for a 1.7B on T4 (full path UNCHANGED). Returns (trainer, lora_info).
+    Live pinned-stack preflight; MEASURED (not assumed) reference-model behavior and M0-M4 memory
+    stages; base-weights frozen proof. Adapter is persisted by the caller (§14). No trainer callbacks
+    (forbidden); the memory canary is the strict pre-admission gate + a post-hoc peak-reserve check."""
+    emit("TRAINING_METHOD", "lora")
+    emit("LEARNING_RATE", LEARNING_RATE)
+
+    def _gpu_free_bytes():
+        try:
+            return int(torch.cuda.mem_get_info(0)[0])
+        except Exception:
+            return None
+
+    def _mem_snapshot(tag):
+        d = {"tag": tag}
+        try:
+            d["allocated_bytes"] = int(torch.cuda.memory_allocated())
+            d["reserved_bytes"] = int(torch.cuda.max_memory_reserved())
+            d["device_free_bytes"] = _gpu_free_bytes()
+        except Exception as e:
+            d["error"] = type(e).__name__
+        try:
+            import resource as _res
+            d["host_rss_mb"] = round(_res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+        except Exception:
+            d["host_rss_mb"] = None
+        return d
+
+    # ---- §4/§21 live pinned-stack LoRA+GRPO API preflight (runtime authoritative) ----
+    pre = {"training_method": "lora"}
+    try:
+        import peft as _peft
+        from peft import LoraConfig as _LoraConfig, get_peft_model as _get_peft_model
+        from peft import TaskType as _TaskType
+        pre["peft_version"] = getattr(_peft, "__version__", None)
+    except Exception as e:
+        STATE["gates"]["lora_api_preflight"] = "FAIL"
+        emit("LORA_API", "FAIL: peft import " + type(e).__name__ + ":" + str(e)[:120])
+        blocked("PINNED_STACK_LORA_GRPO_UNSUPPORTED", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+    tp_trainer = set(inspect.signature(GRPOTrainer.__init__).parameters)
+    pre["trl_version"] = trl.__version__
+    pre["trainer_accepts_peft_config"] = "peft_config" in tp_trainer
+    pre["trainer_accepts_processing_class"] = "processing_class" in tp_trainer
+    try:
+        lcfg_sig = set(inspect.signature(_LoraConfig.__init__).parameters)
+        pre["lora_config_accepts_target_modules"] = "target_modules" in lcfg_sig
+        pre["lora_config_accepts_task_type"] = "task_type" in lcfg_sig
+    except Exception:
+        pre["lora_config_signature_error"] = True
+    pre["lora_r"] = LORA_R; pre["lora_alpha"] = LORA_ALPHA; pre["lora_dropout"] = LORA_DROPOUT
+    pre["lora_target_mode"] = LORA_TARGET_MODE
+    try:
+        pre["beta"] = float(getattr(cfg, "beta", None))
+    except Exception:
+        pre["beta"] = None
+    pre["sync_ref_model"] = bool(getattr(cfg, "sync_ref_model", False))
+    if not pre["trainer_accepts_processing_class"]:
+        with open(RUN + "/lora_grpo_preflight.json", "w") as fh:
+            json.dump(pre, fh, indent=2)
+        STATE["gates"]["lora_api_preflight"] = "FAIL"
+        emit("LORA_API", "FAIL: GRPOTrainer lacks processing_class (TRL %s)" % pre["trl_version"])
+        blocked("PINNED_STACK_LORA_GRPO_UNSUPPORTED", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+    STATE["gates"]["lora_api_preflight"] = "PASS"
+    emit("LORA_API", "PASS trl=%s peft=%s" % (pre["trl_version"], pre.get("peft_version")))
+
+    # ---- §7 memory stages ----
+    props = torch.cuda.get_device_properties(0)
+    total_bytes = int(props.total_memory)
+    torch.cuda.reset_peak_memory_stats()
+    mem = {"total_gpu_bytes": total_bytes, "M0_empty": _mem_snapshot("M0")}
+
+    # ---- M1: fp16 base + tokenizer + named-linear inspection ----
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    _tok_lora = AutoTokenizer.from_pretrained(MODEL)
+    if _tok_lora.pad_token is None:
+        _tok_lora.pad_token = _tok_lora.eos_token
+    dtype = torch.float16 if FP16 else (torch.bfloat16 if BF16 else torch.float32)
+    base = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=dtype).to("cuda")
+    base.eval()
+    import torch.nn as _nn
+    lin_names = [n for n, m in base.named_modules() if isinstance(m, _nn.Linear)]
+    mem["M1_base_loaded"] = _mem_snapshot("M1")
+    emit("LORA_M1", "base loaded %d linear modules" % len(lin_names))
+
+    # ---- §2 target modules: all-linear if supported by the pinned PEFT, else derived ----
+    target = LORA_TARGET_MODE
+    all_linear_supported = False
+    if target == "all-linear":
+        try:
+            _LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias="none",
+                        task_type=_TaskType.CAUSAL_LM, target_modules="all-linear")
+            all_linear_supported = True
+        except Exception:
+            all_linear_supported = False
+    if not all_linear_supported:
+        target = [n.rsplit(".", 1)[-1] for n in lin_names
+                  if any(k in n.lower() for k in ("q_proj", "k_proj", "v_proj", "o_proj",
+                                                  "gate_proj", "up_proj", "down_proj"))]
+    lora_cfg = _LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias="none",
+                           task_type=_TaskType.CAUSAL_LM, target_modules=target)
+    with open(RUN + "/lora_config.json", "w") as fh:
+        json.dump({"r": LORA_R, "lora_alpha": LORA_ALPHA, "lora_dropout": LORA_DROPOUT, "bias": "none",
+                   "task_type": "CAUSAL_LM", "target_mode": LORA_TARGET_MODE,
+                   "all_linear_supported": all_linear_supported, "target_modules": target,
+                   "named_linear_count": len(lin_names),
+                   "named_linear_sample": sorted(lin_names)[:40]}, fh, indent=2)
+
+    # ---- M2: attach LoRA ----
+    peft_model = _get_peft_model(base, lora_cfg)
+    mem["M2_lora_attached"] = _mem_snapshot("M2")
+    emit("LORA_M2", "lora attached")
+
+    # ---- §6 trainable-parameter proof (base must be frozen) ----
+    total_p = 0; train_p = 0; unexpected = []
+    for n, p in peft_model.named_parameters():
+        nl = n.lower()
+        total_p += p.numel()
+        if p.requires_grad:
+            if ("lora_" in nl) or ("lora" in nl):
+                train_p += p.numel()
+            else:
+                unexpected.append(n)
+    if unexpected:
+        STATE["gates"]["lora_freeze"] = "FAIL"
+        emit("LORA_FREEZE", "FAIL non-lora trainable: " + unexpected[:5])
+        blocked("LORA_FREEZE_CONTRACT_FAIL", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+    frac = (train_p / total_p) if total_p else 0.0
+    ps = {"total_parameters": total_p, "trainable_parameters": train_p,
+          "trainable_fraction": round(frac, 8), "base_frozen": True, "lora_trainable": train_p > 0,
+          "unexpected_trainable_base_parameters": 0}
+    with open(RUN + "/parameter_summary.json", "w") as fh:
+        json.dump(ps, fh, indent=2)
+    STATE["gates"]["lora_freeze"] = "PASS" if (train_p > 0 and frac < 1.0) else "FAIL"
+    emit("LORA_PARAMS", "total=%d train=%d frac=%.6f" % (total_p, train_p, frac))
+    if STATE["gates"]["lora_freeze"] != "PASS":
+        blocked("LORA_FREEZE_CONTRACT_FAIL", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+
+    # ---- M3: GRPOTrainer on the pre-applied PeftModel (§5 reference-memory gate, measured) ----
+    _alloc_before = int(torch.cuda.memory_allocated())
+    trainer_l = GRPOTrainer(model=peft_model, processing_class=_tok_lora,
+                            reward_funcs=reward_correct, train_dataset=train, args=cfg)
+    _alloc_after = int(torch.cuda.memory_allocated())
+    ref_delta = max(0, _alloc_after - _alloc_before)
+    mem["M3_trainer_constructed"] = _mem_snapshot("M3")
+    if ref_delta > 3.0e9:
+        mem["reference_delta_bytes"] = ref_delta
+        mem["reference_behavior"] = "A_separate_full_model"
+        mem["admission"] = "BLOCK"
+        with open(RUN + "/memory_admission.json", "w") as fh:
+            json.dump(mem, fh, indent=2)
+        STATE["gates"]["lora_reference_memory"] = "BLOCK"
+        emit("LORA_REF", "BLOCK delta=%d bytes -> separate full ref model resident" % ref_delta)
+        blocked("LORA_GRPO_REFERENCE_MEMORY_BLOCK", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+    reference_behavior = "B_disable_adapter"
+    mem["reference_delta_bytes"] = ref_delta
+    mem["reference_behavior"] = reference_behavior
+    STATE["gates"]["lora_reference_memory"] = "PASS"
+    emit("LORA_REF", "behavior=%s delta=%d bytes" % (reference_behavior, ref_delta))
+
+    # ---- §7 projected reserve before authorizing the first optimizer step ----
+    # M4 optimizer state is created inside train() (no callback allowed); project it from M3 +
+    # a conservative single-step activation estimate. Not treating uncertainty as admission.
+    ACTIVATION_EST_BYTES = 4.0e9
+    m3_alloc = mem["M3_trainer_constructed"].get("allocated_bytes", _alloc_after)
+    projected_peak = max(m3_alloc, _alloc_after) + ACTIVATION_EST_BYTES
+    projected_reserve = total_bytes - projected_peak
+    admission_ok = projected_reserve >= 2.5e9
+    mem["M4_optimizer_projected"] = {"note": "optimizer state created inside train(); projected, not measured pre-step",
+                                     "activation_estimate_bytes": int(ACTIVATION_EST_BYTES),
+                                     "projected_peak_bytes": int(projected_peak),
+                                     "projected_reserve_bytes": int(projected_reserve),
+                                     "admission_reserve_required_bytes": 2500000000,
+                                     "admission_ok": bool(admission_ok)}
+    with open(RUN + "/memory_admission.json", "w") as fh:
+        json.dump(mem, fh, indent=2)
+    STATE["gates"]["lora_memory_admission"] = "PASS" if admission_ok else "UNKNOWN"
+    emit("LORA_ADMISSION", "projected_reserve=%.2fGB ok=%s" % (projected_reserve / 1e9, admission_ok))
+    if not admission_ok:
+        blocked("LORA_GRPO_T4_MEMORY_UNKNOWN", "COLAB_GRPO_CONTROL_PLANE_FAIL")
+
+    pre["memory_admission_ok"] = bool(admission_ok)
+    with open(RUN + "/lora_grpo_preflight.json", "w") as fh:
+        json.dump(pre, fh, indent=2)
+    lora_info = {"pre": pre, "mem": mem, "param": ps, "total_bytes": total_bytes}
+    return trainer_l, lora_info
+
+
 # ---- GRPO trainer construct ----
 hb("TRAINER_READY", 0)
 trainer = None
+lora_info = None
 try:
     train = pool.select(train_idx).map(lambda r: {"prompt": build_prompt(r)}, load_from_cache_file=False)
     keep = {"prompt", "answer", "reward_mode", "atol", "rtol", "bucket_prefix"}
@@ -700,7 +917,10 @@ try:
     cfg = GRPOConfig(**CFG)
     STATE["gates"]["GRPOConfig_construct"] = "PASS"
     emit("GRPOCONFIG_CONSTRUCT", "ok")
-    trainer = GRPOTrainer(model=MODEL, reward_funcs=reward_correct, train_dataset=train, args=cfg)
+    if TRAINING_METHOD == "lora":
+        trainer, lora_info = build_lora_trainer(train, cfg)
+    else:
+        trainer = GRPOTrainer(model=MODEL, reward_funcs=reward_correct, train_dataset=train, args=cfg)
     STATE["gates"]["GRPOTrainer_construct"] = "PASS"
     emit("GRPOTRAINER_CONSTRUCT", "ok")
 except Exception as e:
@@ -831,5 +1051,111 @@ verdict = "COLAB_GRPO_CONTROL_PLANE_PASS" if (train_status == "success" and STAT
 STATE["terminal"] = verdict
 emit("GRPO_DONE", "ok" if train_status == "success" else "fail")
 emit("GRPO_VERDICT", verdict)
+# ---- §10-§16 LoRA post-train: adapter, groups, classifications (full path untouched) ----
+if TRAINING_METHOD == "lora" and lora_info is not None:
+    STATE["training_method"] = "lora"
+    STATE["lora_pre"] = lora_info["pre"]
+    STATE["lora_mem"] = lora_info["mem"]
+    STATE["lora_param"] = lora_info["param"]
+    # NaN/Inf check
+    _loss_val = STATE.get("trainer_loss")
+    _kl_val = STATE.get("trainer_kl")
+    _nan_inf = False
+    for _v in (_loss_val, _kl_val):
+        try:
+            if _v is not None and (math.isnan(float(_v)) or math.isinf(float(_v))):
+                _nan_inf = True
+        except Exception:
+            pass
+    STATE["nan_inf_detected"] = _nan_inf
+    emit("NAN_INF", _nan_inf)
+    # §14 adapter save (adapter-only, NOT full base model)
+    adapter_dir = ART + "/adapter"
+    adapter_saved = False
+    adapter_size = None
+    try:
+        import os as _os_a
+        _os_a.makedirs(adapter_dir, exist_ok=True)
+        _m = trainer.model
+        while hasattr(_m, "module"):
+            _m = _m.module
+        _m.save_pretrained(adapter_dir)
+        import glob as _g_a
+        _sz = 0
+        for _f in _g_a.glob(adapter_dir + "/adapter_model*"):
+            _sz += _os_a.path.getsize(_f)
+        adapter_saved = _os_a.path.isfile(adapter_dir + "/adapter_config.json")
+        adapter_size = _sz
+        emit("ADAPTER_SAVE", "ok bytes=%d" % _sz)
+    except Exception as _ae:
+        emit("ADAPTER_SAVE", "FAIL:" + type(_ae).__name__ + ":" + str(_ae)[:120])
+    STATE["adapter_saved"] = adapter_saved
+    STATE["adapter_size_bytes"] = adapter_size
+    STATE["adapter_dir"] = adapter_dir
+    STATE["base_model_id"] = MODEL
+    try:
+        import json as _j_a
+        _ac = _os_a.path.join(adapter_dir, "adapter_config.json") if adapter_saved else None
+        if _ac and _os_a.path.isfile(_ac):
+            with open(_ac) as _af:
+                _acfg = _j_a.load(_af)
+            STATE["adapter_config"] = _acfg
+            STATE["base_model_revision"] = _acfg.get("base_model_name_or_path", MODEL)
+    except Exception:
+        pass
+    # §11/§12 group rewards
+    groups = list(_lora_group_rewards)
+    zero_adv = sum(1 for g in groups if not g.get("informative"))
+    informative = sum(1 for g in groups if g.get("informative"))
+    nonzero_rewards = sum(1 for g in groups for r in g["rewards"] if r > 0)
+    signal_present = informative > 0
+    STATE["grpo_groups"] = groups
+    STATE["zero_advantage_group_count"] = zero_adv
+    STATE["informative_group_count"] = informative
+    STATE["nonzero_reward_count"] = nonzero_rewards
+    STATE["grpo_signal_present"] = signal_present
+    with open(RUN + "/group_rewards.jsonl", "w") as fh:
+        for g in groups:
+            fh.write(json.dumps(g) + "\n")
+    emit("GROUPS", "total=%d informative=%d zero_adv=%d" % (len(groups), informative, zero_adv))
+    # §16 four independent classifications
+    memory_feasible = (not _nan_inf and train_status == "success"
+                       and STATE["gates"].get("lora_memory_admission") == "PASS"
+                       and STATE["gates"].get("lora_reference_memory") == "PASS")
+    training_execution_valid = (train_status == "success" and (gstep or 0) >= 1
+                                 and STATE["gates"].get("GRPOTrainer_construct") == "PASS")
+    pre_mr = (pre or {}).get("mean_reward")
+    post_mr = (post or {}).get("mean_reward")
+    quality_improved = (pre_mr is not None and post_mr is not None and post_mr > pre_mr)
+    STATE["memory_feasible"] = memory_feasible
+    STATE["training_execution_valid"] = training_execution_valid
+    STATE["grpo_signal_present"] = signal_present
+    STATE["quality_improved"] = quality_improved
+    # §13/§26 LoRA verdict
+    if not memory_feasible:
+        lora_verdict = "1P7B_LORA_GRPO_T4_MEMORY_BLOCKED"
+    elif not training_execution_valid:
+        lora_verdict = "1P7B_LORA_GRPO_T4_FAIL"
+    elif signal_present:
+        lora_verdict = "1P7B_LORA_GRPO_T4_PASS"
+    else:
+        lora_verdict = "1P7B_LORA_GRPO_T4_EXECUTION_PASS"
+    STATE["lora_verdict"] = lora_verdict
+    emit("LORA_VERDICT", lora_verdict)
+    # post-hoc reserve verification (§9: observed reserve >= 2.0 GB)
+    try:
+        _obs_peak = int(torch.cuda.max_memory_reserved())
+        _obs_res = lora_info["total_bytes"] - _obs_peak
+        STATE["observed_peak_reserved_bytes"] = _obs_peak
+        STATE["observed_reserve_bytes"] = _obs_res
+        STATE["observed_reserve_gb"] = round(_obs_res / 1e9, 3)
+        if _obs_res < 2.0e9:
+            STATE["observed_reserve_margin_fail"] = True
+            emit("RESERVE_MARGIN", "FAIL observed=%.2fGB < 2.0GB" % (_obs_res / 1e9))
+        else:
+            STATE["observed_reserve_margin_fail"] = False
+            emit("RESERVE_MARGIN", "PASS observed=%.2fGB" % (_obs_res / 1e9))
+    except Exception:
+        pass
 persist_final("success" if train_status == "success" else "failed", train_err)
 sys.exit(0)

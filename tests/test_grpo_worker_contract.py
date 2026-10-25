@@ -460,5 +460,92 @@ class TruncationClassification(unittest.TestCase):
         self.assertEqual(gpc.classify_truncation("print(1)", parse, True), "PARSE_OK")
 
 
+class LoRAContract(unittest.TestCase):
+    """§17/§18/§19/§21 static contract tests for the LoRA-GRPO branch.
+    Full path (TRAINING_METHOD=full) must remain unchanged.
+    No QLoRA/bitsandbytes/vllm. No TrainerCallback. Pinned-stack only."""
+
+    def setUp(self):
+        with open(WORKER, encoding="utf-8") as fh:
+            self.src = fh.read()
+
+    def test_training_method_env(self):
+        self.assertIn('TRAINING_METHOD = (_env("TRAINING_METHOD", "full")', self.src)
+
+    def test_lora_env_vars(self):
+        for var in ("LORA_R", "LORA_ALPHA", "LORA_DROPOUT", "LORA_TARGET_MODE"):
+            self.assertIn(var, self.src, var)
+
+    def test_build_lora_trainer_exists(self):
+        self.assertIn("def build_lora_trainer(train, cfg):", self.src)
+
+    def test_conditional_construct(self):
+        self.assertIn('if TRAINING_METHOD == "lora":', self.src)
+        self.assertIn("trainer, lora_info = build_lora_trainer(train, cfg)", self.src)
+
+    def test_full_path_unchanged(self):
+        self.assertIn("trainer = GRPOTrainer(model=MODEL, reward_funcs=reward_correct", self.src)
+
+    def test_no_qlora_or_bnb(self):
+        for forbidden in ("bitsandbytes", "bnb", "qlora", "QLoRA", "4bit", "8bit"):
+            self.assertNotIn(forbidden, self.src, "forbidden: %s" % forbidden)
+
+    def test_no_vllm_in_lora(self):
+        # use_vllm must be env-defaulted to False and wired into CFG (no hardcoded vllm on)
+        self.assertIn('"use_vllm": USE_VLLM', self.src)
+        self.assertIn('_bool("USE_VLLM", False)', self.src)
+
+    def test_no_trainer_callback_in_lora(self):
+        self.assertNotIn("TrainerCallback", self.src)
+
+    def test_math_imported(self):
+        self.assertIn("import math", self.src)
+
+    def test_lora_artifacts_written(self):
+        for artifact in ("lora_grpo_preflight.json", "lora_config.json",
+                         "parameter_summary.json", "memory_admission.json",
+                         "group_rewards.jsonl"):
+            self.assertIn(artifact, self.src, artifact)
+
+    def test_adapter_save_present(self):
+        self.assertIn("save_pretrained", self.src)
+        self.assertIn("adapter_config.json", self.src)
+
+    def test_lora_verdict_present(self):
+        self.assertIn("1P7B_LORA_GRPO_T4_PASS", self.src)
+        self.assertIn("1P7B_LORA_GRPO_T4_EXECUTION_PASS", self.src)
+        self.assertIn("1P7B_LORA_GRPO_T4_MEMORY_BLOCKED", self.src)
+        self.assertIn("1P7B_LORA_GRPO_T4_FAIL", self.src)
+
+    def test_reference_memory_gate(self):
+        self.assertIn("LORA_GRPO_REFERENCE_MEMORY_BLOCK", self.src)
+        self.assertIn("lora_reference_memory", self.src)
+
+    def test_memory_admission_gate(self):
+        self.assertIn("LORA_GRPO_T4_MEMORY_UNKNOWN", self.src)
+        self.assertIn("lora_memory_admission", self.src)
+
+    def test_freeze_contract(self):
+        self.assertIn("LORA_FREEZE_CONTRACT_FAIL", self.src)
+        self.assertIn("lora_freeze", self.src)
+
+    def test_pinned_stack_guard(self):
+        self.assertIn("PINNED_STACK_LORA_GRPO_UNSUPPORTED", self.src)
+
+    def test_per_group_reward_tracking(self):
+        self.assertIn("_lora_group_rewards", self.src)
+        self.assertIn("informative", self.src)
+        self.assertIn("reward_variance", self.src)
+
+    def test_nan_inf_check(self):
+        self.assertIn("nan_inf_detected", self.src)
+        self.assertIn("math.isnan", self.src)
+
+    def test_post_train_classifications(self):
+        for key in ("memory_feasible", "training_execution_valid",
+                    "grpo_signal_present", "quality_improved"):
+            self.assertIn(key, self.src, key)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
