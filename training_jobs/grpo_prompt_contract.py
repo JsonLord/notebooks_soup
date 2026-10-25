@@ -42,7 +42,9 @@ the staged data by the known-correct computation is quarantined as
 GOLD_UNREPRODUCIBLE, kept in diagnostic logs, but excluded from the reward
 denominator so it is counted as neither model success nor model failure.
 """
+import ast
 import json
+import re
 
 
 def inspect_staged_contract(sb, inp="/home/user/input"):
@@ -151,7 +153,14 @@ def build_prompt(r, contract=None):
             "Write one Python program in a ```python block, then stop.\n"
             "- Look at the data if you need to, then compute the answer.\n"
             "- The final answer must be the last non-empty stdout line.\n"
-            "- Keep it under 40 lines." % (r["question"], contract_text))
+            "- Keep it under 40 lines.\n"
+            "\n"
+            "Output code contract (follow exactly):\n"
+            "- Return executable Python source only, inside one ```python block.\n"
+            "- Use real newline characters between lines; never write a break as a backslash-n pair.\n"
+            "- Do not wrap the whole program in a quoted string or return it as one string literal.\n"
+            "- Do not add prose before or after the code, and do not escape the source.\n"
+            "- Your code must be directly parseable as Python source." % (r["question"], contract_text))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -169,3 +178,70 @@ def task_validity_for(bucket_prefix):
     if "california-crime" in bp or "fbi-us__california" in bp:
         return "GOLD_UNREPRODUCIBLE"
     return "VALIDATED"
+
+
+def extract_code(completion):
+    text = completion[-1]["content"] if isinstance(completion, list) else completion
+    blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text or "", re.S)
+    return (blocks[-1] if blocks else text or "").strip()
+
+
+def ast_preflight(code):
+    """Pure AST gate. Parse `code` and report parseability WITHOUT altering it.
+
+    Returns {"ok": bool, "syntax_error_type", "syntax_error_line",
+    "syntax_error_message"}. No repair, no replace, no decode, no regeneration
+    (HARDEN_CODE_OUTPUT_CONTRACT §3/§4): an unparseable program is merely
+    detected earlier than sandbox execution; the same terminal zero-reward
+    outcome is unchanged. Empty/blank code is a parse failure too.
+    """
+    src = code if isinstance(code, str) else (code or "")
+    if src.strip() == "":
+        return {"ok": False, "syntax_error_type": "EMPTY_SOURCE",
+                "syntax_error_line": None, "syntax_error_message": "no source"}
+    try:
+        ast.parse(src)
+        return {"ok": True, "syntax_error_type": None,
+                "syntax_error_line": None, "syntax_error_message": None}
+    except SyntaxError as e:
+        return {"ok": False, "syntax_error_type": type(e).__name__,
+                "syntax_error_line": e.lineno, "syntax_error_message": e.msg}
+
+
+def classify_form_error(code, parse):
+    """Deterministic FORM taxonomy for one extracted program (no repair).
+
+    `parse` is ast_preflight(code). Assign ONE primary terminal classification
+    plus overlapping flags where the evidence supports them (§7). Flags:
+      contains_literal_backslash_n (two-char backslash + n present) + count
+    Primary order: if parse ok -> PARSE_OK; else the most specific of
+    LITERAL_ESCAPED_NEWLINES / UNTERMINATED_STRING / INDENTATION_ERROR /
+    UNMATCHED_DELIMITER / INVALID_SYNTAX / PARSE_OTHER.
+    """
+    src = code if isinstance(code, str) else (code or "")
+    lit = src.count("\\n")
+    flags = {"contains_literal_backslash_n": lit > 0, "literal_backslash_n_count": lit}
+    if parse.get("ok"):
+        return dict(flags, primary="PARSE_OK", flags=["PARSE_OK"])
+    t = (parse.get("syntax_error_type") or "")
+    m = (parse.get("syntax_error_message") or "").lower()
+    if "invalid non-printable" in m or "null bytes" in m:
+        primary = "PARSE_OTHER"
+    elif lit > 0 and ("unterminated string" in m):
+        primary = "UNTERMINATED_STRING"      # §7 example: lit flag + unterminated
+    elif lit > 0:
+        primary = "LITERAL_ESCAPED_NEWLINES"
+    elif "unterminated string" in m:
+        primary = "UNTERMINATED_STRING"
+    elif "expected an indented block" in m or "unexpected indent" in m or t == "IndentationError":
+        primary = "INDENTATION_ERROR"
+    elif "was never closed" in m or "unmatched" in m or "parentheses" in m or "bracket" in m:
+        primary = "UNMATCHED_DELIMITER"
+    elif "invalid syntax" in m:
+        primary = "INVALID_SYNTAX"
+    else:
+        primary = "PARSE_OTHER"
+    flags_list = [primary]
+    if lit > 0 and primary != "LITERAL_ESCAPED_NEWLINES":
+        flags_list.append("LITERAL_ESCAPED_NEWLINES")
+    return dict(flags, primary=primary, flags=flags_list)

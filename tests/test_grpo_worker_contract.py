@@ -27,7 +27,7 @@ import grpo_prompt_contract as gpc  # noqa: E402
 WORKER = os.path.join(TRAINING_JOBS, "grpo_smoldataenvs.py")
 MODULE = os.path.join(TRAINING_JOBS, "grpo_eval_split.py")
 MODULE_PC = os.path.join(TRAINING_JOBS, "grpo_prompt_contract.py")
-NAMES_PC = ("inspect_staged_contract", "stage_bucket", "build_prompt", "task_validity_for")
+NAMES_PC = ("inspect_staged_contract", "stage_bucket", "build_prompt", "task_validity_for", "extract_code")
 
 
 def _funcs(path):
@@ -314,6 +314,77 @@ class TaskValidity(unittest.TestCase):
         self.assertEqual(sc["n"], 2)
         self.assertAlmostEqual(sc["nonzero_reward_rate"], 0.5)
         self.assertNotAlmostEqual(sc["nonzero_reward_rate"], 1.0 / 3.0)  # not dragged by quarantined 0
+
+
+class CodeOutputContract(unittest.TestCase):
+    # HARDEN_CODE_OUTPUT_CONTRACT §8/§9: deterministic output-contract tests for
+    # the committed, shared measurement helpers (extract_code + ast_preflight +
+    # classify_form_error). No GPU/HF/torch. extract_code is drift-verified equal
+    # to the worker's copy (NAMES_PC), so the extraction policy is ONE system and
+    # the AST gate is the same for the training worker and the inference probe.
+
+    def test_real_multiline_python_parses(self):
+        code = 'import pandas as pd\ndf = pd.read_csv("x.csv")\nprint(len(df))'
+        p = gpc.ast_preflight(code)
+        self.assertTrue(p["ok"])
+        self.assertEqual(gpc.classify_form_error(code, p)["primary"], "PARSE_OK")
+
+    def test_literal_escaped_newlines_fail_and_flag(self):
+        code = 'import pandas as pd\\ndf = pd.read_csv("x.csv")\\nprint(len(df))'
+        p = gpc.ast_preflight(code)
+        self.assertFalse(p["ok"])
+        c = gpc.classify_form_error(code, p)
+        self.assertTrue(c["contains_literal_backslash_n"])
+        self.assertGreaterEqual(c["literal_backslash_n_count"], 2)
+        self.assertIn("LITERAL_ESCAPED_NEWLINES", c["flags"])
+
+    def test_quoted_source_not_decoded_or_repaired(self):
+        raw = '"import pandas as pd\\nprint(1)"'
+        code = gpc.extract_code(raw)
+        self.assertEqual(code, raw.strip())             # returned unchanged
+        self.assertNotIn("\nprint(1)", code)             # not decoded into two statements
+
+    def test_fenced_valid_code_extracts_parseable(self):
+        raw = "Here is the program:\n```python\nprint(1)\n```\n"
+        code = gpc.extract_code(raw)
+        self.assertEqual(code, "print(1)")
+        self.assertTrue(gpc.ast_preflight(code)["ok"])
+
+    def test_prose_plus_code_deterministic_extraction(self):
+        raw = "Sure! ```python\nprint(2)\n``` done"
+        code = gpc.extract_code(raw)
+        self.assertEqual(code, "print(2)")
+        self.assertTrue(gpc.ast_preflight(code)["ok"])
+
+    def test_parse_failure_is_terminal_and_unmutated(self):
+        bad = "def f(:\n    return 1"
+        p = gpc.ast_preflight(bad)
+        self.assertFalse(p["ok"])
+        self.assertEqual(p["syntax_error_type"], "SyntaxError")
+        self.assertEqual(gpc.extract_code(bad), bad)   # generated code stays authoritative
+        c = gpc.classify_form_error(bad, p)
+        self.assertIn(c["primary"], ("INVALID_SYNTAX", "UNTERMINATED_STRING",
+                                     "INDENTATION_ERROR", "UNMATCHED_DELIMITER",
+                                     "LITERAL_ESCAPED_NEWLINES", "PARSE_OTHER"))
+
+    def test_no_output_mutating_repair_in_execution_path(self):
+        # §9: the extraction/preflight/classify path must only extract + strip +
+        # fence-unwrap + PARSE; it must never semantically repair generated code.
+        with open(MODULE_PC, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename=MODULE_PC)
+        funcs = {}
+        for n in tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name in (
+                    "extract_code", "ast_preflight", "classify_form_error"):
+                funcs[n.name] = ast.get_source_segment(src, n)
+        self.assertEqual(set(funcs.keys()), {"extract_code", "ast_preflight", "classify_form_error"})
+        for name, seg in funcs.items():
+            self.assertNotIn('replace("\\\\n"', seg, "newline-repair in %s" % name)
+            self.assertNotIn("unicode_escape", seg, "unicode_escape in %s" % name)
+            self.assertNotIn(".decode(", seg, "decode in %s" % name)
+            self.assertNotIn(".encode(", seg, "encode in %s" % name)
+        self.assertIn(".strip()", funcs["extract_code"])
 
 
 if __name__ == "__main__":

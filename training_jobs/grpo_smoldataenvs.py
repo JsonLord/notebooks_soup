@@ -164,7 +164,14 @@ def build_prompt(r, contract=None):
             "Write one Python program in a ```python block, then stop.\n"
             "- Look at the data if you need to, then compute the answer.\n"
             "- The final answer must be the last non-empty stdout line.\n"
-            "- Keep it under 40 lines." % (r["question"], contract_text))
+            "- Keep it under 40 lines.\n"
+            "\n"
+            "Output code contract (follow exactly):\n"
+            "- Return executable Python source only, inside one ```python block.\n"
+            "- Use real newline characters between lines; never write a break as a backslash-n pair.\n"
+            "- Do not wrap the whole program in a quoted string or return it as one string literal.\n"
+            "- Do not add prose before or after the code, and do not escape the source.\n"
+            "- Your code must be directly parseable as Python source." % (r["question"], contract_text))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
