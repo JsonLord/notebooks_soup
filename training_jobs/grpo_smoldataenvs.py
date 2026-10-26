@@ -280,6 +280,8 @@ EVAL_TASK_LIMIT = _num("EVAL_TASK_LIMIT", 6, int)
 FP16 = _bool("FP16", True)
 BF16 = _bool("BF16", False)
 USE_VLLM = _bool("USE_VLLM", False)
+# ---- §3 search: restrict the training/eval population to VALIDATED tasks ----
+VALIDITY_FILTER = _bool("VALIDITY_FILTER", False)
 # ---- §17/§18 training-method parameterization (full path UNCHANGED when method != lora) ----
 TRAINING_METHOD = (_env("TRAINING_METHOD", "full") or "full").strip().lower()
 LORA_R = _num("LORA_R", 16, int)
@@ -560,9 +562,15 @@ try:
     ds = load_dataset(DS, split="train")
     tierset = set(difficulty_tiers)
     pool = ds.filter(lambda r: (r.get("difficulty_tier") in tierset))
+    _excluded_invalid = 0
+    if VALIDITY_FILTER:
+        _before_vf = len(pool)
+        pool = pool.filter(lambda r: (task_validity_for(r.get("bucket_prefix", "")) == "VALIDATED"))
+        _excluded_invalid = _before_vf - len(pool)
     pool = pool.shuffle(seed=SEED)
     total = len(pool)
-    emit("DATASET_GATE", "ok rows=%d pool=%d" % (len(ds), total))
+    STATE["validity_filter"] = {"enabled": VALIDITY_FILTER, "excluded": _excluded_invalid}
+    emit("DATASET_GATE", "ok rows=%d pool=%d excluded_invalid=%d" % (len(ds), total, _excluded_invalid))
 except Exception as e:
     STATE["gates"]["dataset_load"] = "FAIL"
     emit("DATASET_GATE", "FAIL:" + type(e).__name__ + ":" + str(e)[:120])
