@@ -67,11 +67,31 @@ def check_budget(exec_count, cu_used, projected_cu=0.15):
     return True
 
 def verify_no_active_session():
-    r = subprocess.run(["colab", "status", "-s", SESSION], capture_output=True, text=True, timeout=30)
-    return r.returncode != 0  # no session = returncode != 0
+    r = subprocess.run(["colab", "status"], capture_output=True, text=True, timeout=30)
+    out = (r.stdout or "") + (r.stderr or "")
+    return "No active sessions" in out
+
+def provision_session():
+    """Provision a fresh T4 with the pinned stack."""
+    log("Provisioning T4 session %s..." % SESSION)
+    subprocess.run(["colab", "new", "-s", SESSION, "--gpu", "T4"], capture_output=True, text=True, timeout=120)
+    log("Installing pinned stack...")
+    subprocess.run(["colab", "install", "-s", SESSION, "trl==1.16.0", "peft==0.21.2"], capture_output=True, text=True, timeout=300)
+    log("Removing torchao...")
+    subprocess.run(["colab", "exec", "-s", SESSION, "-f", "training_jobs/torchao_remove.py", "--timeout", "120"], capture_output=True, text=True, timeout=180)
+    log("Restarting kernel...")
+    subprocess.run(["colab", "restart-kernel", "-s", SESSION], capture_output=True, text=True, timeout=60)
+    log("Session ready.")
 
 def run_candidate(candidate_id, lr, lora_r, lora_alpha, steps, base_eval):
     """Run one candidate via run_remote_grpo.py. Returns (results_dict, cu_elapsed)."""
+    # Provision fresh T4 (orchestrator stops the session via guarded_stop)
+    if not verify_no_active_session():
+        log("Session still active, stopping first...")
+        subprocess.run(["colab", "stop", "-s", SESSION], capture_output=True, text=True, timeout=60)
+        time.sleep(5)
+    provision_session()
+
     attempt_id = "%s-lr%0.0e-r%d-s%d" % (candidate_id, lr, lora_r, steps)
     remote_run_dir = "/content/opentraining/pilot/%s/%s" % (JOB_ID, attempt_id)
     remote_archive = "/content/opentraining/artifacts/%s-%s.tar.gz" % (JOB_ID, attempt_id)

@@ -119,7 +119,7 @@ def stage_bucket(sb, bucket_prefix):
     return sb.run("rm -rf /home/user/input/* && BUCKET_PREFIX='%s' python3 /opt/pull_bucket.py" % bp, check=False)
 
 
-def build_prompt(r, contract=None):
+def build_prompt(r, contract=None, variant="P0"):
     """Build the chat messages for row `r`, disclosing the staged contract.
 
     When `contract` (from inspect_staged_contract) is provided, every staged
@@ -129,6 +129,11 @@ def build_prompt(r, contract=None):
     legacy nominal-files prompt, so the trainer's dataset `.map` site -- where no
     bucket is staged yet -- keeps producing the SAME prompt as before with zero
     behavior change. No gold / solution / grader internals are ever emitted.
+
+    `variant` selects the reasoning scaffolding (P0-P3). P0 is the original
+    prompt with no scaffolding. P1-P3 add progressively richer internal
+    task-solving checklists without providing any answer, solution, or grader
+    detail. The output code contract is identical across all variants.
     """
     system = "You are a data analyst. You answer questions about data files by writing a short Python program and reading what it prints."
     files = (contract or {}).get("files") or []
@@ -146,6 +151,48 @@ def build_prompt(r, contract=None):
             for t, cols in fr["tables"].items():
                 parts.append("  Table " + str(t) + ": " + ", ".join(cols))
     contract_text = ("\n".join(parts) + "\n\n") if files else ""
+    _scaffolds = {
+        "P0": "",
+        "P1": ("\nBefore writing the program, internally determine:\n"
+               "1. Which supplied file/database contains the needed information.\n"
+               "2. Which exact columns/tables correspond to the question.\n"
+               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+               "4. What exact answer format the question requests.\n"
+               "Then output only the executable Python program.\n"),
+        "P2": ("\nBefore writing the program, internally determine:\n"
+               "1. Which supplied file/database contains the needed information.\n"
+               "2. Which exact columns/tables correspond to the question.\n"
+               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+               "4. What exact answer format the question requests.\n"
+               "Then output only the executable Python program.\n"
+               "When working with tabular data:\n"
+               "- inspect the supplied column names exactly\n"
+               "- convert numeric-looking strings when arithmetic is required\n"
+               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+               "- do not assume a field is numeric merely because the question sounds numeric\n"
+               "- use the actual supplied schema rather than guessed field names\n"),
+        "P3": ("\nBefore writing the program, internally determine:\n"
+               "1. Which supplied file/database contains the needed information.\n"
+               "2. Which exact columns/tables correspond to the question.\n"
+               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+               "4. What exact answer format the question requests.\n"
+               "Then output only the executable Python program.\n"
+               "When working with tabular data:\n"
+               "- inspect the supplied column names exactly\n"
+               "- convert numeric-looking strings when arithmetic is required\n"
+               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+               "- do not assume a field is numeric merely because the question sounds numeric\n"
+               "- use the actual supplied schema rather than guessed field names\n"
+               "Internally:\n"
+               "A. choose the relevant supplied data source\n"
+               "B. load/query it using its exact filename/schema\n"
+               "C. derive the requested value\n"
+               "D. sanity-check that the result matches the requested quantity/type\n"
+               "E. print only the requested final answer\n"
+               "Prefer the simplest correct program.\n"
+               "Avoid unnecessary helper functions or unrelated processing.\n"),
+    }
+    scaffold = _scaffolds.get(variant, "")
     user = ("%s\n\n%s"
             "The files are in /home/user/input and your program runs in that directory.\n"
             "Use the exact filenames and column/table names shown above.\n"
@@ -154,13 +201,13 @@ def build_prompt(r, contract=None):
             "- Look at the data if you need to, then compute the answer.\n"
             "- The final answer must be the last non-empty stdout line.\n"
             "- Keep it under 40 lines.\n"
-            "\n"
-            "Output code contract (follow exactly):\n"
+            "%s"
+            "\nOutput code contract (follow exactly):\n"
             "- Return executable Python source only, inside one ```python block.\n"
             "- Use real newline characters between lines; never write a break as a backslash-n pair.\n"
             "- Do not wrap the whole program in a quoted string or return it as one string literal.\n"
             "- Do not add prose before or after the code, and do not escape the source.\n"
-            "- Your code must be directly parseable as Python source." % (r["question"], contract_text))
+            "- Your code must be directly parseable as Python source." % (r["question"], contract_text, scaffold))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
