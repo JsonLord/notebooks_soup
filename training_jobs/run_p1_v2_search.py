@@ -73,11 +73,18 @@ def provision_session():
     run_cmd(["colab", "new", "-s", SESSION, "--gpu", "T4"], timeout=180)
     log("Installing pinned stack...")
     run_cmd(["colab", "install", "-s", SESSION, "trl==1.16.0", "peft==0.21.2"], timeout=600)
-    run_cmd(["colab", "exec", "-s", SESSION, "pip uninstall -y torchao"], timeout=120)
-    # Restart kernel to pick up clean env
-    run_cmd(["colab", "restart", "-s", SESSION], timeout=120)
+    log("Removing torchao...")
+    run_cmd(["colab", "exec", "-s", SESSION, "-f", "training_jobs/torchao_remove.py", "--timeout", "120"], timeout=180)
+    log("Restarting kernel...")
+    run_cmd(["colab", "restart-kernel", "-s", SESSION], timeout=120)
     time.sleep(5)
     log("Session ready.")
+
+def colab_exec_file(local_file, env_vars=None, timeout=600):
+    cmd = ["colab", "exec", "-s", SESSION, "-f", local_file, "--timeout", str(timeout)]
+    for k, v in (env_vars or {}).items():
+        cmd.extend(["--env", "%s=%s" % (k, v)])
+    return run_cmd(cmd, timeout=timeout + 120)
 
 def colab_exec(code, timeout=600):
     return run_cmd(["colab", "exec", "-s", SESSION, code], timeout=timeout)
@@ -244,17 +251,23 @@ def main():
     
     provision_session()
     
-    # Generate splits on T4
-    colab_upload("training_jobs/generate_v2_splits.py", "/content/opentraining/p1-v2/generate_v2_splits.py")
-    colab_upload("training_jobs/grpo_smoldataenvs.py", "/content/opentraining/p1-v2/grpo_smoldataenvs.py")
-    colab_upload("training_jobs/grpo_prompt_contract.py", "/content/opentraining/p1-v2/grpo_prompt_contract.py")
-    colab_exec("cd /content/opentraining/p1-v2 && SPLIT_OUT_DIR=/content/opentraining/p1-v2/splits python3 generate_v2_splits.py", timeout=300)
+    # Run self-contained bootstrap: split gen + 128-gen confirmation in one exec
+    log("Running bootstrap (splits + 128-gen confirmation) on T4...")
+    _hf_tok = os.environ.get("HF_TOKEN", "")
+    colab_exec_file("training_jobs/p1_v2_bootstrap.py",
+                    env_vars={"HF_TOKEN": _hf_tok, "MODEL": MODEL},
+                    timeout=7200)
     
-    # Download splits
+    # Download splits + results
     colab_download("/content/opentraining/p1-v2/splits/p1_confirmation_split.json", os.path.join(SPLITS_DIR, "p1_confirmation_split.json"))
     colab_download("/content/opentraining/p1-v2/splits/p1_lora_search_v2_split.json", os.path.join(SPLITS_DIR, "p1_lora_search_v2_split.json"))
+    colab_download("/content/opentraining/p1-v2/confirm/results.json", os.path.join(CONFIRM_DIR, "results.json"))
     
-    # Verify splits
+    if not os.path.exists(os.path.join(CONFIRM_DIR, "results.json")):
+        log("FATAL: confirmation results not found after download")
+        guarded_stop()
+        return "SEARCH_BLOCKED"
+    
     with open(os.path.join(SPLITS_DIR, "p1_confirmation_split.json")) as f:
         confirm_split = json.load(f)
     with open(os.path.join(SPLITS_DIR, "p1_lora_search_v2_split.json")) as f:
@@ -263,19 +276,6 @@ def main():
         len(confirm_split.get("task_ids", [])),
         len(v2_split.get("train_task_ids", [])),
         len(v2_split.get("eval_task_ids", []))))
-    
-    # Run confirmation probe
-    colab_upload("training_jobs/probe_p1_confirmation.py", "/content/opentraining/p1-v2/probe_p1_confirmation.py")
-    colab_exec(
-        "cd /content/opentraining/p1-v2 && "
-        "SPLIT_FILE=/content/opentraining/p1-v2/splits/p1_confirmation_split.json "
-        "PROBE_OUT=/content/opentraining/p1-v2/confirm "
-        "MODEL=%s " % MODEL +
-        "HF_TOKEN=$HF_TOKEN "
-        "python3 probe_p1_confirmation.py",
-        timeout=3600)
-    
-    colab_download("/content/opentraining/p1-v2/confirm/results.json", os.path.join(CONFIRM_DIR, "results.json"))
     
     # Check confirmation gate
     with open(os.path.join(CONFIRM_DIR, "results.json")) as f:
@@ -318,9 +318,8 @@ def main():
         guarded_stop()
         return budget_err
     
-    # Upload V2 split to T4
-    colab_upload(os.path.join(SPLITS_DIR, "p1_lora_search_v2_split.json"),
-                 "/content/opentraining/pilot/p1-v2/splits/p1_lora_search_v2_split.json")
+    # V2 split already at /content/opentraining/pilot/p1-v2/splits/ from bootstrap
+    log("V2 split pre-staged by bootstrap at /content/opentraining/pilot/p1-v2/splits/")
     
     anchor = run_training_candidate("P1-ANCHOR", "1e-5", 16, 32, 20,
                                      "/content/opentraining/pilot/p1-v2/splits/p1_lora_search_v2_split.json")
