@@ -43,6 +43,7 @@ GOLD_UNREPRODUCIBLE, kept in diagnostic logs, but excluded from the reward
 denominator so it is counted as neither model success nor model failure.
 """
 import ast
+import hashlib
 import json
 import re
 
@@ -119,6 +120,66 @@ def stage_bucket(sb, bucket_prefix):
     return sb.run("rm -rf /home/user/input/* && BUCKET_PREFIX='%s' python3 /opt/pull_bucket.py" % bp, check=False)
 
 
+# Canonical reasoning-scaffold text per prompt variant. build_prompt reads from
+# this dict; the worker keeps a BYTE-IDENTICAL copy. prompt_variant_signature
+# hashes the (variant -> scaffold) mapping so a runtime can detect if the frozen
+# prompt text drifted (PROMPT_DRIFT hard-stop) without depending on a specific
+# task row. The mapping is task-independent: it covers the scaffold, not the
+# data disclosure, so a single signature represents the whole variant.
+PROMPT_SCAFFOLDS = {
+    "P0": "",
+    "P1": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"),
+    "P2": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"
+           "When working with tabular data:\n"
+           "- inspect the supplied column names exactly\n"
+           "- convert numeric-looking strings when arithmetic is required\n"
+           "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+           "- do not assume a field is numeric merely because the question sounds numeric\n"
+           "- use the actual supplied schema rather than guessed field names\n"),
+    "P3": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"
+           "When working with tabular data:\n"
+           "- inspect the supplied column names exactly\n"
+           "- convert numeric-looking strings when arithmetic is required\n"
+           "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+           "- do not assume a field is numeric merely because the question sounds numeric\n"
+           "- use the actual supplied schema rather than guessed field names\n"
+           "Internally:\n"
+           "A. choose the relevant supplied data source\n"
+           "B. load/query it using its exact filename/schema\n"
+           "C. derive the requested value\n"
+           "D. sanity-check that the result matches the requested quantity/type\n"
+           "E. print only the requested final answer\n"
+           "Prefer the simplest correct program.\n"
+           "Avoid unnecessary helper functions or unrelated processing.\n"),
+}
+
+
+def prompt_variant_signature(variant):
+    """Return a short task-independent SHA-256 signature for one prompt variant.
+
+    Hashes the (variant, scaffold_text) pair so the worker can prove the frozen
+    prompt text it actually used matches the expected frozen hash. An unknown
+    variant hashes to a sentinel so drift is detected, not silently defaulted.
+    """
+    scaffold = PROMPT_SCAFFOLDS.get(variant, "__UNKNOWN_VARIANT__")
+    return hashlib.sha256((variant + "\x00" + scaffold).encode("utf-8")).hexdigest()[:16]
+
+
 def build_prompt(r, contract=None, variant="P0"):
     """Build the chat messages for row `r`, disclosing the staged contract.
 
@@ -151,48 +212,7 @@ def build_prompt(r, contract=None, variant="P0"):
             for t, cols in fr["tables"].items():
                 parts.append("  Table " + str(t) + ": " + ", ".join(cols))
     contract_text = ("\n".join(parts) + "\n\n") if files else ""
-    _scaffolds = {
-        "P0": "",
-        "P1": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"),
-        "P2": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"
-               "When working with tabular data:\n"
-               "- inspect the supplied column names exactly\n"
-               "- convert numeric-looking strings when arithmetic is required\n"
-               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
-               "- do not assume a field is numeric merely because the question sounds numeric\n"
-               "- use the actual supplied schema rather than guessed field names\n"),
-        "P3": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"
-               "When working with tabular data:\n"
-               "- inspect the supplied column names exactly\n"
-               "- convert numeric-looking strings when arithmetic is required\n"
-               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
-               "- do not assume a field is numeric merely because the question sounds numeric\n"
-               "- use the actual supplied schema rather than guessed field names\n"
-               "Internally:\n"
-               "A. choose the relevant supplied data source\n"
-               "B. load/query it using its exact filename/schema\n"
-               "C. derive the requested value\n"
-               "D. sanity-check that the result matches the requested quantity/type\n"
-               "E. print only the requested final answer\n"
-               "Prefer the simplest correct program.\n"
-               "Avoid unnecessary helper functions or unrelated processing.\n"),
-    }
-    scaffold = _scaffolds.get(variant, "")
+    scaffold = PROMPT_SCAFFOLDS.get(variant, "")
     user = ("%s\n\n%s"
             "The files are in /home/user/input and your program runs in that directory.\n"
             "Use the exact filenames and column/table names shown above.\n"

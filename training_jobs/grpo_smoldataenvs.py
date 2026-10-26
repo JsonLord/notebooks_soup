@@ -15,6 +15,7 @@ SmolDataEnvs grader only, HF Sandbox forward_hf_token=False.
 """
 import importlib.util
 import inspect
+import hashlib
 import json
 import logging
 import math
@@ -131,6 +132,66 @@ def stage_bucket(sb, bucket_prefix):
     return sb.run("rm -rf /home/user/input/* && BUCKET_PREFIX='%s' python3 /opt/pull_bucket.py" % bp, check=False)
 
 
+# Canonical reasoning-scaffold text per prompt variant. build_prompt reads from
+# this dict; the worker keeps a BYTE-IDENTICAL copy. prompt_variant_signature
+# hashes the (variant -> scaffold) mapping so a runtime can detect if the frozen
+# prompt text drifted (PROMPT_DRIFT hard-stop) without depending on a specific
+# task row. The mapping is task-independent: it covers the scaffold, not the
+# data disclosure, so a single signature represents the whole variant.
+PROMPT_SCAFFOLDS = {
+    "P0": "",
+    "P1": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"),
+    "P2": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"
+           "When working with tabular data:\n"
+           "- inspect the supplied column names exactly\n"
+           "- convert numeric-looking strings when arithmetic is required\n"
+           "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+           "- do not assume a field is numeric merely because the question sounds numeric\n"
+           "- use the actual supplied schema rather than guessed field names\n"),
+    "P3": ("\nBefore writing the program, internally determine:\n"
+           "1. Which supplied file/database contains the needed information.\n"
+           "2. Which exact columns/tables correspond to the question.\n"
+           "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
+           "4. What exact answer format the question requests.\n"
+           "Then output only the executable Python program.\n"
+           "When working with tabular data:\n"
+           "- inspect the supplied column names exactly\n"
+           "- convert numeric-looking strings when arithmetic is required\n"
+           "- account for commas, percent signs, missing values, or other formatting when necessary\n"
+           "- do not assume a field is numeric merely because the question sounds numeric\n"
+           "- use the actual supplied schema rather than guessed field names\n"
+           "Internally:\n"
+           "A. choose the relevant supplied data source\n"
+           "B. load/query it using its exact filename/schema\n"
+           "C. derive the requested value\n"
+           "D. sanity-check that the result matches the requested quantity/type\n"
+           "E. print only the requested final answer\n"
+           "Prefer the simplest correct program.\n"
+           "Avoid unnecessary helper functions or unrelated processing.\n"),
+}
+
+
+def prompt_variant_signature(variant):
+    """Return a short task-independent SHA-256 signature for one prompt variant.
+
+    Hashes the (variant, scaffold_text) pair so the worker can prove the frozen
+    prompt text it actually used matches the expected frozen hash. An unknown
+    variant hashes to a sentinel so drift is detected, not silently defaulted.
+    """
+    scaffold = PROMPT_SCAFFOLDS.get(variant, "__UNKNOWN_VARIANT__")
+    return hashlib.sha256((variant + "\x00" + scaffold).encode("utf-8")).hexdigest()[:16]
+
+
 def build_prompt(r, contract=None, variant="P0"):
     """Build the chat messages for row `r`, disclosing the staged contract.
 
@@ -163,48 +224,7 @@ def build_prompt(r, contract=None, variant="P0"):
             for t, cols in fr["tables"].items():
                 parts.append("  Table " + str(t) + ": " + ", ".join(cols))
     contract_text = ("\n".join(parts) + "\n\n") if files else ""
-    _scaffolds = {
-        "P0": "",
-        "P1": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"),
-        "P2": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"
-               "When working with tabular data:\n"
-               "- inspect the supplied column names exactly\n"
-               "- convert numeric-looking strings when arithmetic is required\n"
-               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
-               "- do not assume a field is numeric merely because the question sounds numeric\n"
-               "- use the actual supplied schema rather than guessed field names\n"),
-        "P3": ("\nBefore writing the program, internally determine:\n"
-               "1. Which supplied file/database contains the needed information.\n"
-               "2. Which exact columns/tables correspond to the question.\n"
-               "3. What operation is required: filter / min / max / count / sum / average / ratio / join / SQL query.\n"
-               "4. What exact answer format the question requests.\n"
-               "Then output only the executable Python program.\n"
-               "When working with tabular data:\n"
-               "- inspect the supplied column names exactly\n"
-               "- convert numeric-looking strings when arithmetic is required\n"
-               "- account for commas, percent signs, missing values, or other formatting when necessary\n"
-               "- do not assume a field is numeric merely because the question sounds numeric\n"
-               "- use the actual supplied schema rather than guessed field names\n"
-               "Internally:\n"
-               "A. choose the relevant supplied data source\n"
-               "B. load/query it using its exact filename/schema\n"
-               "C. derive the requested value\n"
-               "D. sanity-check that the result matches the requested quantity/type\n"
-               "E. print only the requested final answer\n"
-               "Prefer the simplest correct program.\n"
-               "Avoid unnecessary helper functions or unrelated processing.\n"),
-    }
-    scaffold = _scaffolds.get(variant, "")
+    scaffold = PROMPT_SCAFFOLDS.get(variant, "")
     user = ("%s\n\n%s"
             "The files are in /home/user/input and your program runs in that directory.\n"
             "Use the exact filenames and column/table names shown above.\n"
@@ -292,6 +312,8 @@ LEARNING_RATE = _num("LEARNING_RATE", 3e-6, float)
 TEMPERATURE = _num("TEMPERATURE", 0.8, float)
 REPETITION_PENALTY = _num("REPETITION_PENALTY", 1.05, float)
 NUM_GENERATIONS = _num("NUM_GENERATIONS", 2, int)
+PROMPT_VARIANT = _env("PROMPT_VARIANT", "P0")
+_prompt_variant_hash = None  # populated after first build_prompt (provenance)
 def resolve_max_new_tokens(env=None, default=128):
     """Resolve the effective generation token budget deterministically.
 
@@ -329,12 +351,33 @@ BF16 = _bool("BF16", False)
 USE_VLLM = _bool("USE_VLLM", False)
 # ---- §3 search: restrict the training/eval population to VALIDATED tasks ----
 VALIDITY_FILTER = _bool("VALIDITY_FILTER", False)
+# ---- P1_SEARCH_V2: inject a deterministic task split (task_id lists) ----
+TASK_SPLIT_FILE = _env("TASK_SPLIT_FILE")  # path to JSON with train_task_ids / eval_task_ids
+# ---- §29 prompt provenance: expected frozen-prompt signature for drift detection ----
+EXPECTED_PROMPT_HASH = _env("EXPECTED_PROMPT_HASH")  # e.g. b57588007ddd5da2 for P1
 # ---- §17/§18 training-method parameterization (full path UNCHANGED when method != lora) ----
 TRAINING_METHOD = (_env("TRAINING_METHOD", "full") or "full").strip().lower()
 LORA_R = _num("LORA_R", 16, int)
 LORA_ALPHA = _num("LORA_ALPHA", 32, int)
 LORA_DROPOUT = _num("LORA_DROPOUT", 0.05, float)
 LORA_TARGET_MODE = _env("LORA_TARGET_MODE", "all-linear")
+# ---- §2/§29 PROMPT_DRIFT gate: verify the frozen prompt text matches the expected hash ----
+_prompt_sig = prompt_variant_signature(PROMPT_VARIANT)
+_prompt_drift_ok = True
+if EXPECTED_PROMPT_HASH:
+    _prompt_drift_ok = (_prompt_sig == EXPECTED_PROMPT_HASH)
+    if not _prompt_drift_ok:
+        emit("PROMPT_DRIFT", "expected=%s actual=%s variant=%s" % (EXPECTED_PROMPT_HASH, _prompt_sig, PROMPT_VARIANT))
+        with open(RUN + "/prompt_drift.json", "w") as fh:
+            json.dump({"expected": EXPECTED_PROMPT_HASH, "actual": _prompt_sig, "variant": PROMPT_VARIANT,
+                       "drift": True}, fh, indent=2)
+        print("EXECUTION_TARGET=COLAB_REMOTE", flush=True)
+        print("GRPO_VERDICT=PROMPT_DRIFT", flush=True)
+        sys.exit(0)
+    else:
+        emit("PROMPT_PROVENANCE", "variant=%s hash=%s MATCH" % (PROMPT_VARIANT, _prompt_sig))
+else:
+    emit("PROMPT_PROVENANCE", "variant=%s hash=%s (no EXPECTED_PROMPT_HASH set)" % (PROMPT_VARIANT, _prompt_sig))
 
 print("EXECUTION_TARGET=COLAB_REMOTE", flush=True)
 os.makedirs(ART + "/checkpoint", exist_ok=True)
@@ -624,7 +667,38 @@ except Exception as e:
     blocked("DATASET", "COLAB_GRPO_CONTROL_PLANE_FAIL")
 STATE["gates"]["dataset_load"] = "PASS"
 try:
-    train_idx, eval_idx = disjoint_split(total, TRAIN_TASK_LIMIT, EVAL_TASK_LIMIT)
+    if TASK_SPLIT_FILE:
+        # P1_SEARCH_V2: load explicit task_id lists from JSON split file
+        with open(TASK_SPLIT_FILE, "r") as _sf:
+            _split = json.load(_sf)
+        _train_tids = _split["train_task_ids"]
+        _eval_tids = _split["eval_task_ids"]
+        # Build task_id → pool index map
+        _tid_to_idx = {pool[i]["task_id"]: i for i in range(total)}
+        _missing_train = [t for t in _train_tids if t not in _tid_to_idx]
+        _missing_eval = [t for t in _eval_tids if t not in _tid_to_idx]
+        if _missing_train or _missing_eval:
+            raise ValueError("TASK_SPLIT_FILE task_ids not in pool: missing_train=%s missing_eval=%s" % (_missing_train[:3], _missing_eval[:3]))
+        # Verify VALIDITY for all tasks in the split
+        _invalid = []
+        for t in _train_tids + _eval_tids:
+            _i = _tid_to_idx[t]
+            if task_validity_for(pool[_i].get("bucket_prefix", "")) != "VALIDATED":
+                _invalid.append(t)
+        if _invalid:
+            raise ValueError("TASK_SPLIT_FILE contains non-VALIDATED tasks: %s" % _invalid[:5])
+        # Verify disjointness
+        _overlap = set(_train_tids) & set(_eval_tids)
+        if _overlap:
+            raise ValueError("TASK_SPLIT_FILE train/eval overlap: %s" % list(_overlap)[:5])
+        train_idx = sorted(_tid_to_idx[t] for t in _train_tids)
+        eval_idx = sorted(_tid_to_idx[t] for t in _eval_tids)
+        STATE["task_split_file"] = TASK_SPLIT_FILE
+        STATE["task_split_train_ids"] = _train_tids
+        STATE["task_split_eval_ids"] = _eval_tids
+        emit("TASK_SPLIT_FILE", "train=%d eval=%d disjoint=YES" % (len(train_idx), len(eval_idx)))
+    else:
+        train_idx, eval_idx = disjoint_split(total, TRAIN_TASK_LIMIT, EVAL_TASK_LIMIT)
     eval_rows = [pool[i] for i in eval_idx]
     manifest["train_subset_indices"] = train_idx
     manifest["eval_subset_indices"] = eval_idx
@@ -737,7 +811,7 @@ def gen_eval_pass(model, tokenizer):
                     stage_bucket(sb, _bp)
                 _contract = inspect_staged_contract(sb)
                 STATE.setdefault("eval_task_validity", []).append(task_validity_for(_bp))
-                msgs = build_prompt(r, contract=_contract)
+                msgs = build_prompt(r, contract=_contract, variant=PROMPT_VARIANT)
                 text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                 enc = tok(text, return_tensors="pt").to(model.device)
                 with torch.no_grad():
@@ -966,7 +1040,7 @@ hb("TRAINER_READY", 0)
 trainer = None
 lora_info = None
 try:
-    train = pool.select(train_idx).map(lambda r: {"prompt": build_prompt(r)}, load_from_cache_file=False)
+    train = pool.select(train_idx).map(lambda r: {"prompt": build_prompt(r, variant=PROMPT_VARIANT)}, load_from_cache_file=False)
     keep = {"prompt", "answer", "reward_mode", "atol", "rtol", "bucket_prefix"}
     train = train.remove_columns([c for c in train.column_names if c not in keep])
     cfg = GRPOConfig(**CFG)

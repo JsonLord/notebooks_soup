@@ -183,6 +183,37 @@ def test_task_validity_unchanged():
     assert task_validity_for("fbi-us__california-crime") == "GOLD_UNREPRODUCIBLE"
 
 
+
+def test_prompt_signature_deterministic():
+    """prompt_variant_signature must be deterministic."""
+    from grpo_prompt_contract import prompt_variant_signature
+    for v in ["P0", "P1", "P2", "P3"]:
+        assert prompt_variant_signature(v) == prompt_variant_signature(v)
+
+
+def test_prompt_signature_variants_differ():
+    """Different variants must have different signatures."""
+    from grpo_prompt_contract import prompt_variant_signature
+    sigs = [prompt_variant_signature(v) for v in ["P0", "P1", "P2", "P3"]]
+    assert len(set(sigs)) == 4, "signatures should differ across variants"
+
+
+def test_prompt_signature_p1_frozen():
+    """P1 scaffold signature must match the frozen value."""
+    from grpo_prompt_contract import prompt_variant_signature
+    assert prompt_variant_signature("P1") == "6310c395fe09c5f9"
+
+
+def test_worker_has_prompt_scaffolds():
+    """Worker must define PROMPT_SCAFFOLDS + prompt_variant_signature (drift prevention)."""
+    with open("training_jobs/grpo_smoldataenvs.py") as f:
+        src = f.read()
+    assert "def prompt_variant_signature(variant):" in src
+    assert "PROMPT_SCAFFOLDS" in src
+    assert "hexdigest()[:16]" in src
+    assert "import hashlib" in src
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0
@@ -195,3 +226,5 @@ if __name__ == "__main__":
             print("FAIL %s: %s" % (t.__name__, e))
             sys.exit(1)
     print("\n%d/%d prompt safety tests passed" % (passed, len(tests)))
+
+
