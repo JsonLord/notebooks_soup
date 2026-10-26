@@ -65,9 +65,10 @@ if not _tok:
 
 from huggingface_hub import HfApi, Sandbox
 w = HfApi().whoami(token=_tok)
-emit("WHOAMI", w.name)
+_wname = w.get("name", "unknown") if isinstance(w, dict) else getattr(w, "name", "unknown")
+emit("WHOAMI", _wname)
 
-SB_IMAGE = "huggingface/sandbox-cpu-basic:latest"
+SB_IMAGE = os.environ.get("SB_IMAGE", "docker.io/savatar101/env-data-agent-train:base")
 sb = Sandbox.create(image=SB_IMAGE, flavor="cpu-basic", idle_timeout="30m", forward_hf_token=False)
 emit("SANDBOX_CREATE", "PASS")
 
